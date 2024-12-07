@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+meds_torch = ["**/*.yaml"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.pyc"]
+
+[project]
+name = "czsl"
+dynamic = ["version"]
+authors = [
+  {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
+  {name="Nassim Oufattole", email="noufattole@gmail.com"},
+  {name="Teya Bergamaschi", email="teyabergamaschi@gmail.com"},
+  {name="Aleksia Kolo", email="aleksiakolo@gmail.com"},
+]
+description = "A MEDS PyTorch Dataset, leveraging a on-the-fly retrieval strategy for flexible, efficient data loading."
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "polars", "pyarrow", "omegaconf", "hydra-core", "rich", "hydra-colorlog", "loguru", "pytimeparse == 1.1.*", "networkx == 3.3.*", "bigtree == 0.18.*", "ruamel.yaml == 0.18.*", "torch", "numpy",
+]
+
+[tool.setuptools_scm]
+
+[project.optional-dependencies]
+dev = ["pre-commit<4","notebook", "pdbpp"]
+tests = ["pytest", "pytest-cov[toml]", "rootutils", "pytest-sugar", "pytest-instafail", "pytest-xdist", "sh"]
+
+[tool.pytest.ini_options]
+addopts = [
+  "--color=yes",
+  "--durations=0",
+  "--strict-markers",
+  "--doctest-modules",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+  "ignore::UserWarning",
+]
+log_cli = "True"
+markers = [
+  "slow: slow tests",
+]
+minversion = "6.0"
+testpaths = "tests/"
+norecursedirs = ["helpers"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: nocover",
+    "raise NotImplementedError",
+    "raise NotImplementedError()",
+    "if __name__ == .__main__.:",
+]
+
+[project.urls]
+Homepage = "https://github.com/oufattole/clinical-zeroshot-labeler"
+Issues = "https://github.com/oufattole/clinical-zeroshot-labeler/issues"
