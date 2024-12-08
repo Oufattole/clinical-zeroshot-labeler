@@ -1,12 +1,16 @@
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from enum import StrEnum
+from enum import Enum
+from typing import Optional
 
 import numpy as np
 import polars as pl
 import torch
 
 from czsl.config import TaskExtractorConfig
+from czsl.utils import parse_timedelta
 
 
 @dataclass
@@ -124,63 +128,163 @@ class TrajectoryBatch:
         return pl.from_dict(data_dict, schema=schema)
 
 
-class BudgetType(StrEnum):
-    """Type of generation budget."""
-
-    SEQUENCE_LENGTH = "sequence_length"
-    TIME = "time"
-    EOS_ONLY = "eos_only"
-
-
 @dataclass
 class GenerationBudget:
-    """A class to handle generation budgets with mutually exclusive constraints.
+    """Optional constraints for generation length and time."""
 
-    Can be one of:
-    - Sequence length budget (max tokens to generate)
-    - Time length budget (minimum time to generate)
-    - EOS-only budget (generate until EOS token, tracking time optionally)
+    max_seq_len: int | None = None
+    max_time: float | None = None
+
+    def __post_init__(self):
+        if self.max_seq_len is not None and self.max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {self.max_seq_len}")
+        if self.max_time is not None and self.max_time <= 0:
+            raise ValueError(f"max_time must be positive, got {self.max_time}")
+
+
+class GenerationTracker:
+    """Tracks generation progress and stopping criteria for token-by-token generation.
+
+    Args:
+        batch_size: Number of sequences being generated
+        eos_tokens: List of tokens that should stop generation (from task config)
+        budget: Optional GenerationBudget with length/time constraints
+        device: Device for torch tensors
 
     Examples:
-        >>> # Create from sequence length
-        >>> budget_seq = GenerationBudget.from_seq_len(100)
-        >>> budget_seq.budget_type
-        <BudgetType.SEQUENCE_LENGTH: 'sequence_length'>
-        >>> budget_seq.value
-        100
-
-        >>> # Create from time length
-        >>> budget_time = GenerationBudget.from_time_len(60)
-        >>> budget_time.budget_type
-        <BudgetType.TIME: 'time'>
-        >>> budget_time.value
-        60
-
-        >>> # Create budget that only stops on EOS
-        >>> budget_eos = GenerationBudget.from_eos_only()
-        >>> budget_eos.budget_type
-        <BudgetType.EOS_ONLY: 'eos_only'>
-        >>> budget_eos.value is None
-        True
+        >>> # Initialize tracker
+        >>> tracker = GenerationTracker(
+        ...     batch_size=2,
+        ...     eos_tokens=[1, 2],  # death or discharge tokens
+        ...     budget=GenerationBudget(max_seq_len=100, max_time=48.0)
+        ... )
+        >>>
+        >>> # Track token by token
+        >>> next_token = torch.tensor([3, 4])  # Some non-EOS tokens
+        >>> tracker.update(next_token)
+        >>> tracker.should_stop
+        False
+        >>> tracker.finished_sequences
+        tensor([False, False])
+        >>>
+        >>> # Hit EOS token
+        >>> next_token = torch.tensor([1, 3])  # First sequence hits death token
+        >>> tracker.update(next_token)
+        >>> tracker.should_stop
+        False
+        >>> tracker.finished_sequences
+        tensor([True, False])
+        >>>
+        >>> # Get masks for unfinished sequences
+        >>> tracker.unfinished_mask
+        tensor([False, True])
     """
 
-    budget_type: BudgetType
-    value: int | float | None = None
+    def __init__(
+        self,
+        batch_size: int,
+        eos_tokens: list[int],
+        budget: GenerationBudget | None = None,
+        device: str = "cpu",
+    ):
+        self.batch_size = batch_size
+        self.eos_tokens = torch.tensor(eos_tokens, device=device) if eos_tokens else None
+        self.budget = budget
+        self.device = device
 
-    @classmethod
-    def from_seq_len(cls, value: int) -> "GenerationBudget":
-        """Create a GenerationBudget from a maximum sequence length."""
-        return cls(budget_type=BudgetType.SEQUENCE_LENGTH, value=value)
+        # Initialize state
+        self.num_generated = 0
+        self.cumulative_time = torch.zeros(batch_size, device=device)
+        self.finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    @classmethod
-    def from_time_len(cls, value: int) -> "GenerationBudget":
-        """Create a GenerationBudget from a minimum time length."""
-        return cls(budget_type=BudgetType.TIME, value=value)
+    def update(self, next_token: torch.Tensor, next_token_time: float | None = None) -> None:
+        """Update tracker with next generated token(s).
 
-    @classmethod
-    def from_eos_only(cls) -> "GenerationBudget":
-        """Create a GenerationBudget that only stops on EOS tokens."""
-        return cls(budget_type=BudgetType.EOS_ONLY)
+        Args:
+            next_token: Tensor of shape (batch_size) with next token IDs
+            next_token_time: Optional time value for time budget tracking
+        """
+        # Update counts
+        self.num_generated += 1
+
+        # Check for EOS tokens
+        if self.eos_tokens is not None:
+            self.finished_sequences |= torch.isin(next_token, self.eos_tokens)
+
+        # Check budgets if specified
+        if self.budget:
+            # Sequence length budget
+            if self.budget.max_seq_len and self.num_generated >= self.budget.max_seq_len:
+                self.finished_sequences.fill_(True)
+
+            # Time budget
+            if self.budget.max_time and next_token_time:
+                self.cumulative_time += next_token_time
+                self.finished_sequences |= self.cumulative_time >= self.budget.max_time
+
+    @property
+    def should_stop(self) -> bool:
+        """Whether all sequences are finished."""
+        return self.finished_sequences.all()
+
+    @property
+    def unfinished_mask(self) -> torch.Tensor:
+        """Boolean mask of shape (batch_size) indicating unfinished sequences."""
+        return ~self.finished_sequences
+
+
+def generate_sequences(
+    model,
+    prompts: torch.Tensor,
+    task_config: "ZeroShotTaskConfig",
+    temperature: float = 1.0,
+    budget: GenerationBudget | None = None,
+    get_next_token_time: callable | None = None,
+) -> torch.Tensor:
+    """Generate sequences using task configuration for stopping criteria.
+
+    Args:
+        model: Model with a generate_next_token method
+        prompts: Initial token sequences
+        task_config: Task configuration
+        temperature: Sampling temperature
+        budget: Optional generation constraints
+        get_next_token_time: Optional function to get time for tokens
+
+    Returns:
+        Generated sequences
+    """
+    batch_size = prompts.shape[0]
+    device = prompts.device
+
+    # Initialize generation tracker
+    tracker = GenerationTracker(
+        batch_size=batch_size, eos_tokens=task_config.get_eos_tokens(), budget=budget, device=device
+    )
+
+    # Initialize output tensors
+    output = prompts.clone()
+
+    # Generate tokens until stopping criteria met
+    while not tracker.should_stop:
+        # Get next token for unfinished sequences
+        next_token = model.generate_next_token(output[tracker.unfinished_mask], temperature=temperature)
+
+        # Update time tracking if needed
+        next_token_time = None
+        if get_next_token_time and budget and budget.max_time:
+            next_token_time = get_next_token_time(next_token)
+
+        # Update tracker
+        tracker.update(next_token, next_token_time)
+
+        # Append tokens
+        if tracker.unfinished_mask.any():
+            new_output = torch.cat([output, torch.zeros_like(next_token).unsqueeze(1)], dim=1)
+            new_output[tracker.unfinished_mask, -1] = next_token
+            output = new_output
+
+    return output
 
 
 @dataclass
@@ -486,3 +590,476 @@ def create_zero_shot_task(yaml_path: str, token_to_code_map: dict[int, str]) -> 
     """
     task_config = TaskExtractorConfig.load(yaml_path)
     return ZeroShotTaskConfig(task_config, token_to_code_map)
+
+
+class ConstraintStatus(Enum):
+    """Status of a constraint evaluation."""
+
+    UNDETERMINED = 0
+    SATISFIED = 1
+    IMPOSSIBLE = 2
+
+
+class BatchConstraintState:
+    """Base class for tracking constraint state across a batch."""
+
+    batch_size: int
+
+    def update(self, tokens: torch.Tensor, times: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Update state with new tokens and return status for each sequence.
+
+        Args:
+            tokens: Tensor of shape (batch_size,) with token IDs
+            times: Optional tensor of shape (batch_size,) with cumulative times
+
+        Returns:
+            Tensor of shape (batch_size,) with ConstraintStatus values
+        """
+        raise NotImplementedError
+
+
+@dataclass
+class BatchTokenMatchState(BatchConstraintState):
+    """Track token occurrences across batch."""
+
+    target_tokens: set[int] = None
+    min_count: int | None = None
+    max_count: int | None = None
+    counts: torch.Tensor | None = None
+    device: str = "cpu"
+
+    def __post_init__(self):
+        self.counts = torch.zeros(self.batch_size, device=self.device)
+        self.target_tokens_tensor = torch.tensor(list(self.target_tokens), device=self.device)
+
+    def update(self, tokens: torch.Tensor, times: torch.Tensor | None = None) -> torch.Tensor:
+        # Update counts where tokens match targets
+        self.counts += torch.isin(tokens, self.target_tokens_tensor).float()
+
+        # Initialize status as UNDETERMINED
+        status = torch.full_like(tokens, ConstraintStatus.UNDETERMINED.value)
+
+        # Update status based on counts
+        if self.max_count is not None:
+            status = torch.where(
+                self.counts > self.max_count,
+                torch.tensor(ConstraintStatus.IMPOSSIBLE.value, device=self.device),
+                status,
+            )
+
+        if self.min_count is not None:
+            status = torch.where(
+                (self.counts >= self.min_count) & (status == ConstraintStatus.UNDETERMINED.value),
+                torch.tensor(ConstraintStatus.SATISFIED.value, device=self.device),
+                status,
+            )
+
+        return status
+
+
+@dataclass
+class BatchTimeWindowState(BatchConstraintState):
+    """Track time windows across batch."""
+
+    min_time: float | None = None
+    max_time: float | None = None
+    include_min: bool = True
+    include_max: bool = True
+    current_times: torch.Tensor | None = None
+    device: str = "cpu"
+
+    def __post_init__(self):
+        self.current_times = torch.zeros(self.batch_size, device=self.device)
+
+    def update(self, tokens: torch.Tensor, times: torch.Tensor | None = None) -> torch.Tensor:
+        if times is None:
+            return torch.full_like(tokens, ConstraintStatus.UNDETERMINED.value)
+
+        self.current_times = times
+        status = torch.full_like(tokens, ConstraintStatus.UNDETERMINED.value)
+
+        if self.max_time is not None:
+            if self.include_max:
+                status = torch.where(
+                    times > self.max_time,
+                    torch.tensor(ConstraintStatus.IMPOSSIBLE.value, device=self.device),
+                    status,
+                )
+            else:
+                status = torch.where(
+                    times >= self.max_time,
+                    torch.tensor(ConstraintStatus.IMPOSSIBLE.value, device=self.device),
+                    status,
+                )
+
+        if self.min_time is not None:
+            mask = status == ConstraintStatus.UNDETERMINED.value
+            if self.include_min:
+                status = torch.where(
+                    mask & (times >= self.min_time),
+                    torch.tensor(ConstraintStatus.SATISFIED.value, device=self.device),
+                    status,
+                )
+            else:
+                status = torch.where(
+                    mask & (times > self.min_time),
+                    torch.tensor(ConstraintStatus.SATISFIED.value, device=self.device),
+                    status,
+                )
+
+        return status
+
+
+@dataclass
+class BatchCompositeState(BatchConstraintState):
+    """Combine multiple constraints with AND/OR logic across batch."""
+
+    states: list[BatchConstraintState]
+    operator: str  # 'and' or 'or'
+    device: str = "cpu"
+
+    def update(self, tokens: torch.Tensor, times: torch.Tensor | None = None) -> torch.Tensor:
+        results = torch.stack([state.update(tokens, times) for state in self.states])
+
+        if self.operator == "and":
+            # IMPOSSIBLE if any state is IMPOSSIBLE
+            status = torch.full_like(tokens, ConstraintStatus.UNDETERMINED.value)
+            status = torch.where(
+                (results == ConstraintStatus.IMPOSSIBLE.value).any(dim=0),
+                torch.tensor(ConstraintStatus.IMPOSSIBLE.value, device=self.device),
+                status,
+            )
+            # SATISFIED if all states are SATISFIED
+            status = torch.where(
+                (results == ConstraintStatus.SATISFIED.value).all(dim=0),
+                torch.tensor(ConstraintStatus.SATISFIED.value, device=self.device),
+                status,
+            )
+        else:  # or
+            # SATISFIED if any state is SATISFIED
+            status = torch.full_like(tokens, ConstraintStatus.UNDETERMINED.value)
+            status = torch.where(
+                (results == ConstraintStatus.SATISFIED.value).any(dim=0),
+                torch.tensor(ConstraintStatus.SATISFIED.value, device=self.device),
+                status,
+            )
+            # IMPOSSIBLE if all states are IMPOSSIBLE
+            status = torch.where(
+                (results == ConstraintStatus.IMPOSSIBLE.value).all(dim=0),
+                torch.tensor(ConstraintStatus.IMPOSSIBLE.value, device=self.device),
+                status,
+            )
+
+        return status
+
+
+@dataclass
+class BatchWindowState(BatchConstraintState):
+    """Track a complete window with time bounds and constraints across batch."""
+
+    time_bounds: BatchTimeWindowState
+    constraints: list[BatchConstraintState]
+    device: str = "cpu"
+
+    def update(self, tokens: torch.Tensor, times: torch.Tensor | None = None) -> torch.Tensor:
+        time_status = self.time_bounds.update(tokens, times)
+
+        # Initialize with time status
+        status = time_status.clone()
+
+        # Where time conditions are met, check other constraints
+        time_mask = time_status == ConstraintStatus.SATISFIED.value
+        if time_mask.any():
+            constraint_results = torch.stack(
+                [
+                    c.update(tokens[time_mask], times[time_mask] if times is not None else None)
+                    for c in self.constraints
+                ]
+            )
+
+            # Update status where time conditions are met
+            impossible_mask = (constraint_results == ConstraintStatus.IMPOSSIBLE.value).any(dim=0)
+            satisfied_mask = (constraint_results == ConstraintStatus.SATISFIED.value).all(dim=0)
+
+            status[time_mask] = torch.where(
+                impossible_mask,
+                torch.tensor(ConstraintStatus.IMPOSSIBLE.value, device=self.device),
+                torch.where(
+                    satisfied_mask,
+                    torch.tensor(ConstraintStatus.SATISFIED.value, device=self.device),
+                    torch.tensor(ConstraintStatus.UNDETERMINED.value, device=self.device),
+                ),
+            )
+
+        return status
+
+
+class BatchAutoregressiveLabeler:
+    """
+    Batch implementation of autoregressive task labeling.
+
+    Examples:
+        >>> # Setup for a batch of 3 sequences
+        >>> batch_size = 3
+        >>> device = "cpu"
+        >>>
+        >>> # Create window states
+        >>> observation = BatchWindowState(
+        ...     batch_size=batch_size,
+        ...     device=device,
+        ...     time_bounds=BatchTimeWindowState(
+        ...         batch_size=batch_size,
+        ...         device=device,
+        ...         max_time=24.0
+        ...     ),
+        ...     constraints=[
+        ...         BatchTokenMatchState(
+        ...             batch_size=batch_size,
+        ...             device=device,
+        ...             target_tokens={1, 2},
+        ...             max_count=0
+        ...         )
+        ...     ]
+        ... )
+        >>>
+        >>> labeler = BatchAutoregressiveLabeler([observation])
+        >>>
+        >>> # Test batch update
+        >>> tokens = torch.tensor([0, 1, 2], device=device)  # One valid, two invalid
+        >>> times = torch.tensor([12.0, 12.0, 12.0], device=device)
+        >>> status = labeler.update(tokens, times)
+        >>> # First sequence still valid, others failed
+        >>> (status == torch.tensor([
+        ...     ConstraintStatus.UNDETERMINED.value,
+        ...     ConstraintStatus.IMPOSSIBLE.value,
+        ...     ConstraintStatus.IMPOSSIBLE.value
+        ... ])).all()
+        True
+    """
+
+    def __init__(self, windows: list[BatchWindowState]):
+        self.windows = windows
+
+    def update(self, tokens: torch.Tensor, times: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Update with new tokens and return status for each sequence.
+
+        Args:
+            tokens: Tensor of shape (batch_size,) with token IDs
+            times: Optional tensor of shape (batch_size,) with cumulative times
+
+        Returns:
+            Tensor of shape (batch_size,) with ConstraintStatus values
+        """
+        results = torch.stack([window.update(tokens, times) for window in self.windows])
+
+        # Initialize status
+        status = torch.full_like(tokens, ConstraintStatus.UNDETERMINED.value)
+
+        # Task fails if any window is impossible
+        status = torch.where(
+            (results == ConstraintStatus.IMPOSSIBLE.value).any(dim=0),
+            torch.tensor(ConstraintStatus.IMPOSSIBLE.value, device=status.device),
+            status,
+        )
+
+        # Task succeeds if all windows are satisfied
+        status = torch.where(
+            (results == ConstraintStatus.SATISFIED.value).all(dim=0),
+            torch.tensor(ConstraintStatus.SATISFIED.value, device=status.device),
+            status,
+        )
+
+        return status
+
+    @classmethod
+    def from_task_config(
+        cls,
+        task_config: "TaskExtractorConfig",
+        token_to_code_map: dict[int, str],
+        batch_size: int,
+        device: str = "cpu",
+    ) -> "BatchAutoregressiveLabeler":
+        """Create BatchAutoregressiveLabeler from ACES task config.
+
+        Args:
+            task_config: ACES task configuration
+            token_to_code_map: Mapping from token IDs to predicate codes
+            batch_size: Number of sequences in batch
+            device: Torch device
+
+        Returns:
+            Configured BatchAutoregressiveLabeler
+
+        Examples:
+            >>> # Create from config
+            >>> batch_size = 2
+            >>> device = "cpu"
+            >>> labeler = BatchAutoregressiveLabeler.from_task_config(
+            ...     task_config=task_config,
+            ...     token_to_code_map={
+            ...         0: "PAD",
+            ...         1: "ICU_ADMISSION//MEDICAL",
+            ...         2: "HOSPITAL_DISCHARGE//MEDICAL",
+            ...         3: "MEDS_DEATH"
+            ...     },
+            ...     batch_size=batch_size,
+            ...     device=device
+            ... )
+        """
+
+        def create_predicate_state(predicate_name: str) -> BatchConstraintState:
+            """Create a batched constraint state for a predicate."""
+            predicate = task_config.predicates[predicate_name]
+            if hasattr(predicate, "code"):
+                # Plain predicate
+                # Handle regex and exact matches
+                if isinstance(predicate.code, dict) and "regex" in predicate.code:
+                    # For regex, compile pattern and match against values
+                    pattern = re.compile(predicate.code["regex"])
+                    tokens = {k for k, v in token_to_code_map.items() if pattern.match(v)}
+                else:
+                    # For exact match
+                    tokens = {k for k, v in token_to_code_map.items() if v == predicate.code}
+                return BatchTokenMatchState(batch_size=batch_size, device=device, target_tokens=tokens)
+            else:
+                # Derived predicate
+                if predicate.expr.startswith("and("):
+                    preds = [p.strip() for p in predicate.expr[4:-1].split(",")]
+                    return BatchCompositeState(
+                        batch_size=batch_size,
+                        device=device,
+                        states=[create_predicate_state(p) for p in preds],
+                        operator="and",
+                    )
+                else:  # or
+                    preds = [p.strip() for p in predicate.expr[3:-1].split(",")]
+                    return BatchCompositeState(
+                        batch_size=batch_size,
+                        device=device,
+                        states=[create_predicate_state(p) for p in preds],
+                        operator="or",
+                    )
+
+        # Create window states
+        window_states = []
+        for window_name, window_config in task_config.windows.items():
+            # Create time bounds
+            time_bounds = BatchTimeWindowState(
+                batch_size=batch_size,
+                device=device,
+                min_time=0.0 if window_config.start is None else parse_timedelta(window_config.start),
+                max_time=None if window_config.end is None else parse_timedelta(window_config.end),
+                include_min=window_config.start_inclusive,
+                include_max=window_config.end_inclusive,
+            )
+
+            # Create constraints for each predicate
+            constraints = []
+            for pred_name, (min_count, max_count) in window_config.has.items():
+                pred_state = create_predicate_state(pred_name)
+                if isinstance(pred_state, BatchTokenMatchState):
+                    pred_state.min_count = min_count
+                    pred_state.max_count = max_count
+                constraints.append(pred_state)
+
+            window_states.append(
+                BatchWindowState(
+                    batch_size=batch_size, device=device, time_bounds=time_bounds, constraints=constraints
+                )
+            )
+
+        return cls(windows=window_states)
+
+
+@dataclass
+class GenerationOutput:
+    """Results from sequence generation."""
+
+    sequences: torch.Tensor  # shape: [batch_size, seq_len]
+    satisfied: torch.Tensor  # shape: [batch_size], boolean
+    impossible: torch.Tensor  # shape: [batch_size], boolean
+
+
+def generate(
+    model,
+    prompts: torch.Tensor,
+    task_config: "ZeroShotTaskConfig",
+    budget: Optional["GenerationBudget"] = None,
+    temperature: float = 1.0,
+    get_next_token_time: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> GenerationOutput:
+    """
+    Generate sequences using both budget and task constraints.
+
+    Args:
+        model: Model with generate_next_token(prompts, temperature) method
+        prompts: Starting token sequences [batch_size, prompt_len]
+        task_config: Task configuration
+        budget: Optional generation budget constraints
+        temperature: Sampling temperature
+        get_next_token_time: Optional function to get time deltas for tokens
+
+    Returns:
+        GenerationOutput containing sequences and their final statuses
+    """
+    batch_size = prompts.shape[0]
+    device = prompts.device
+
+    # Initialize trackers
+    generation_tracker = GenerationTracker(
+        batch_size=batch_size, eos_tokens=task_config.get_eos_tokens(), budget=budget, device=device
+    )
+
+    # Create task labeler using factory method
+    labeler = BatchAutoregressiveLabeler.from_task_config(
+        task_config=task_config.task_config,
+        token_to_code_map=task_config.token_to_code_map,
+        batch_size=batch_size,
+        device=device,
+    )
+
+    # Initialize output tensors
+    current_output = prompts.clone()
+    satisfied = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    impossible = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    # Generate until all sequences are done
+    while not generation_tracker.should_stop:
+        # Generate next tokens for unfinished sequences
+        active_mask = generation_tracker.unfinished_mask
+
+        if active_mask.any():
+            # Get next tokens from model
+            next_tokens = model.generate_next_token(current_output[active_mask], temperature=temperature)
+
+            # Get time if needed
+            next_token_time = None
+            if get_next_token_time is not None:
+                next_token_time = get_next_token_time(next_tokens)
+
+            # Update generation tracker
+            generation_tracker.update(next_tokens, next_token_time)
+
+            # Update task labeler
+            task_status = labeler.update(next_tokens, generation_tracker.cumulative_time[active_mask])
+
+            # Update sequence statuses
+            newly_satisfied = task_status == ConstraintStatus.SATISFIED.value
+            newly_impossible = task_status == ConstraintStatus.IMPOSSIBLE.value
+
+            satisfied[active_mask] |= newly_satisfied
+            impossible[active_mask] |= newly_impossible
+
+            # Mark sequences as finished if task status determined
+            generation_tracker.finished_sequences[active_mask] |= newly_satisfied | newly_impossible
+
+            # Append tokens
+            new_output = torch.cat(
+                [current_output, torch.zeros(batch_size, 1, dtype=torch.long, device=device)], dim=1
+            )
+            new_output[active_mask, -1] = next_tokens
+            current_output = new_output
+
+    return GenerationOutput(sequences=current_output, satisfied=satisfied, impossible=impossible)

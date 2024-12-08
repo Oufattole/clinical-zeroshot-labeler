@@ -1,321 +1,210 @@
 import tempfile
-from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 import torch
 
-from czsl.labeler import create_zero_shot_task
+from czsl.labeler import create_zero_shot_task, generate
 
 
-class DummyTransformerWrapper:
-    """Mock transformer that generates predictable sequences for testing."""
+class DummyModel:
+    """Dummy model that returns predefined sequence patterns."""
 
-    def __init__(self, vocab_size: int = 5, max_seq_len: int = 100):
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
+    def __init__(self, sequences: list[list[tuple[int, float]]]):
+        """
+        Args:
+            sequences: List of [(token, time), ...] for each sequence in batch
+        """
+        self.sequences = sequences
+        self.current_positions = [0] * len(sequences)
 
-    def forward(self, x, **kwargs):
-        """Always predict uniform distribution over vocab."""
-        b, t = x.shape
-        # Return logits and cache
-        return torch.ones(b, t, self.vocab_size), None
+    def generate_next_token(self, prompts: torch.Tensor) -> torch.Tensor:
+        """Return next token for each sequence."""
+        tokens = []
+        for i, seq in enumerate(self.sequences):
+            if self.current_positions[i] < len(seq):
+                tokens.append(seq[self.current_positions[i]][0])
+                self.current_positions[i] += 1
+            else:
+                tokens.append(0)  # pad token
+        return torch.tensor(tokens, device=prompts.device)
 
-
-def generate_with_task(model, prompts, task_config, temperature=1.0, **kwargs):
-    """
-    Dummy generation function for testing. Simulates generation by extending prompts
-    with random tokens until stopping criteria are met.
-
-    Args:
-        model: The DummyTransformerWrapper model
-        prompts: Input token sequences [batch_size, seq_len]
-        task_config: ZeroShotTaskConfig object
-        temperature: Sampling temperature (not used in dummy implementation)
-        **kwargs: Additional arguments (not used in dummy implementation)
-
-    Returns:
-        tuple: (generated_sequences, sequence_lengths)
-    """
-    import torch
-
-    batch_size = prompts.shape[0]
-    device = prompts.device
-
-    # Get generation parameters from task config
-    budget = task_config.get_generation_budget()
-    eos_tokens = task_config.get_eos_tokens()
-
-    # Initialize output sequences with prompts
-    outputs = prompts.clone()
-
-    # Track finished sequences
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    sequence_lengths = torch.ones(batch_size, dtype=torch.int) * outputs.shape[1]
-
-    # Generate until all sequences are finished
-    max_new_tokens = 100  # Safety limit
-    for i in range(max_new_tokens):
-        # Generate one random token for each unfinished sequence
-        new_tokens = torch.randint(0, model.vocab_size, (batch_size, 1), device=device)
-        outputs = torch.cat([outputs, new_tokens], dim=1)
-
-        # Update finished flags based on generation budget
-        if budget.budget_type == "eos_only":
-            # Check for EOS tokens
-            if eos_tokens:
-                for b in range(batch_size):
-                    if not finished[b] and new_tokens[b, 0] in eos_tokens:
-                        finished[b] = True
-                        sequence_lengths[b] = outputs.shape[1]
-
-        elif budget.budget_type == "sequence_length":
-            # Check sequence length
-            if outputs.shape[1] >= budget.value:
-                finished.fill_(True)
-                sequence_lengths.fill_(outputs.shape[1])
-
-        elif budget.budget_type == "time":
-            # Simulate time budget with token count
-            # For testing, assume each token takes 1 time unit
-            if i >= budget.value:
-                finished.fill_(True)
-                sequence_lengths.fill_(outputs.shape[1])
-
-        # Stop if all sequences are finished
-        if finished.all():
-            break
-
-    return outputs, sequence_lengths
-
-
-@dataclass
-class GenerationTestCase:
-    """Test case for generation behavior."""
-
-    yaml_str: str
-    token_map: dict
-    expected_eos_tokens: list[int]
-    expected_budget_type: str
-    expected_budget_value: float | None = None
-    expected_target_codes: list[int] = None
+    def get_next_token_time(self, token: torch.Tensor) -> torch.Tensor:
+        """Return time for each token."""
+        times = []
+        for i, seq in enumerate(self.sequences):
+            pos = self.current_positions[i] - 1  # already incremented
+            if pos < len(seq):
+                times.append(seq[pos][1])
+            else:
+                times.append(0.0)
+        return torch.tensor(times, device=token.device)
 
 
 @pytest.fixture
-def base_token_map():
-    """Fixture providing basic token to code mapping."""
+def task_config_yaml():
+    return """
+    predicates:
+      hospital_discharge:
+        code: { regex: "^HOSPITAL_DISCHARGE//.*" }
+      icu_admission:
+        code: { regex: "^ICU_ADMISSION//.*" }
+      icu_discharge:
+        code: { regex: "^ICU_DISCHARGE//.*" }
+      death:
+        code: MEDS_DEATH
+      discharge_or_death:
+        expr: or(icu_discharge, death, hospital_discharge)
+
+    trigger: icu_admission
+
+    windows:
+      input:
+        start: null
+        end: trigger + 24h
+        start_inclusive: True
+        end_inclusive: True
+        index_timestamp: end
+      gap:
+        start: trigger
+        end: start + 48h
+        start_inclusive: False
+        end_inclusive: True
+        has:
+          icu_admission: (None, 0)
+          discharge_or_death: (None, 0)
+      target:
+        start: gap.end
+        end: start -> discharge_or_death
+        start_inclusive: False
+        end_inclusive: True
+        label: death
+    """
+
+
+@pytest.fixture
+def token_map():
     return {
-        0: "event_type//ICU_ADMISSION",
-        1: "event_type//DEATH",
-        2: "event_type//DISCHARGE",
-        3: "event_type//LAB_RESULT",
-        4: "event_type//MEDICATION",
+        0: "PAD",
+        1: "ICU_ADMISSION//MEDICAL",
+        2: "ICU_DISCHARGE//MEDICAL",
+        3: "HOSPITAL_DISCHARGE//MEDICAL",
+        4: "MEDS_DEATH",
+        5: "OTHER_EVENT",
     }
 
 
 @pytest.fixture
-def dummy_model():
-    """Fixture providing a dummy transformer model."""
-    return DummyTransformerWrapper(vocab_size=5, max_seq_len=20)
-
-
-def create_config_file(yaml_str: str) -> Path:
-    """Create a temporary YAML file."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(yaml_str)
-        return Path(f.name)
-
-
-@pytest.fixture
-def icu_mortality_yaml():
-    """Fixture providing ICU mortality prediction YAML."""
-    return """
-    predicates:
-      icu_admission:
-        code: "event_type//ICU_ADMISSION"
-      death:
-        code: "event_type//DEATH"
-      discharge:
-        code: "event_type//DISCHARGE"
-      death_or_discharge:
-        expr: "or(death, discharge)"
-    trigger: "icu_admission"
-    windows:
-      observation:
-        start: null
-        end: "trigger + 24h"
-        start_inclusive: true
-        end_inclusive: true
-        has:
-          "_ANY_EVENT": "(1, None)"
-        index_timestamp: "end"
-      outcome:
-        start: "observation.end"
-        end: "start -> death_or_discharge"
-        start_inclusive: false
-        end_inclusive: true
-        has: {}
-        label: "death"
-    """
+def successful_death_sequence():
+    """Patient admitted to ICU, survives gap period, then dies."""
+    return [
+        (1, 0.0),  # ICU admission at t=0
+        (5, 20.0),  # Some other event during input window
+        (5, 40.0),  # Some other event during gap window
+        (4, 72.0),  # Death after gap window
+    ]
 
 
 @pytest.fixture
-def lab_value_yaml():
-    """Fixture providing lab value prediction YAML."""
-    return """
-    predicates:
-      lab_normal:
-        code: "event_type//LAB_RESULT"
-        value_min: 0.0
-        value_max: 1.0
-      lab_high:
-        code: "event_type//LAB_RESULT"
-        value_min: 1.0
-      any_lab:
-        expr: "or(lab_normal, lab_high)"
-    trigger: "icu_admission"
-    windows:
-      observation:
-        start: null
-        end: "trigger + 12h"
-        start_inclusive: true
-        end_inclusive: true
-        has:
-          "_ANY_EVENT": "(1, None)"
-      prediction:
-        start: "observation.end"
-        end: "start + 24h"
-        start_inclusive: false
-        end_inclusive: true
-        has: {}
-        label: "lab_high"
-    """
+def successful_discharge_sequence():
+    """Patient admitted to ICU, survives gap period, then discharged."""
+    return [
+        (1, 0.0),  # ICU admission at t=0
+        (5, 20.0),  # Some other event during input window
+        (5, 40.0),  # Some other event during gap window
+        (3, 72.0),  # Hospital discharge after gap window
+    ]
 
 
 @pytest.fixture
-def medication_yaml():
-    """Fixture providing medication prediction YAML."""
-    return """
-    predicates:
-      icu_admission:
-        code: "event_type//ICU_ADMISSION"
-      medication:
-        code: "event_type//MEDICATION"
-      lab_abnormal:
-        code: "event_type//LAB_RESULT"
-        value_min: 2.0
-      med_trigger:
-        expr: "and(lab_abnormal, icu_admission)"
-    trigger: "med_trigger"
-    windows:
-      observation:
-        start: null
-        end: "trigger + 6h"
-        start_inclusive: true
-        end_inclusive: true
-        has:
-          "_ANY_EVENT": "(1, None)"
-      outcome:
-        start: "observation.end"
-        end: "start -> medication"
-        start_inclusive: false
-        end_inclusive: true
-        has: {}
-        label: "medication"
-    """
+def impossible_readmission_sequence():
+    """Patient readmitted to ICU during gap period."""
+    return [
+        (1, 0.0),  # Initial ICU admission
+        (5, 12.0),  # Other event
+        (1, 24.0),  # Another ICU admission during gap
+        (4, 72.0),  # Death (but sequence already failed)
+    ]
 
 
-def test_generation_case(
-    yaml_str: str,
-    token_map: dict,
-    expected_eos_tokens: list[int],
-    expected_budget_type: str,
-    expected_budget_value: float | None,
-    expected_target_codes: list[int],
-    dummy_model: DummyTransformerWrapper,
+@pytest.fixture
+def undetermined_sequence():
+    """Patient with no conclusive outcome."""
+    return [
+        (1, 0.0),  # ICU admission
+        (5, 24.0),  # Other event at input window boundary
+        (5, 48.0),  # Other event at gap window boundary
+        (5, 72.0),  # Other event (no death/discharge)
+    ]
+
+
+def test_basic_task_outcomes(
+    task_config_yaml,
+    token_map,
+    successful_death_sequence,
+    successful_discharge_sequence,
+    impossible_readmission_sequence,
+    undetermined_sequence,
 ):
-    """Test a single generation case."""
-    config_path = create_config_file(yaml_str)
-    try:
-        task_config = create_zero_shot_task(yaml_path=config_path, token_to_code_map=token_map)
+    """Test basic task outcomes with different sequence patterns."""
+    # Create config from YAML
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
+        f.write(task_config_yaml)
+        f.flush()
+        task_config = create_zero_shot_task(f.name, token_map)
 
-        # Check EOS tokens
-        eos_tokens = task_config.get_eos_tokens()
-        assert sorted(eos_tokens) == sorted(expected_eos_tokens)
+    # Create model with test sequences
+    test_sequences = [
+        successful_death_sequence,
+        successful_discharge_sequence,
+        impossible_readmission_sequence,
+        undetermined_sequence,
+    ]
+    model = DummyModel(test_sequences)
 
-        # Check budget
-        budget = task_config.get_generation_budget()
-        assert budget.budget_type.value == expected_budget_type
+    # Create dummy prompts
+    batch_size = len(test_sequences)
+    prompts = torch.zeros((batch_size, 1), dtype=torch.long)
 
-        if expected_budget_value is not None:
-            assert budget.value == expected_budget_value
+    # Generate sequences
+    sequences, satisfied, impossible = generate(model=model, prompts=prompts, task_config=task_config)
 
-        # Check labeler target codes if specified
-        if expected_target_codes is not None:
-            labeler = task_config.get_task_labeler()
-            assert sorted(labeler.target_codes) == sorted(expected_target_codes)
+    # Check outcomes
+    assert satisfied[0]  # Death sequence succeeded
+    assert satisfied[1]  # Discharge sequence succeeded
+    assert impossible[2]  # Readmission sequence failed
+    assert not satisfied[3] and not impossible[3]  # Undetermined sequence
 
-        # Test actual generation
-        B, S = 2, 5  # batch_size, sequence_length
-        prompts = torch.randint(0, dummy_model.vocab_size, (B, S))
+    # Check sequence lengths
+    assert len(sequences[0]) == len(successful_death_sequence)
+    assert len(sequences[1]) == len(successful_discharge_sequence)
+    assert len(sequences[2]) <= len(impossible_readmission_sequence)  # Should stop early
+    assert len(sequences[3]) == len(undetermined_sequence)
 
-        outputs, lengths = generate_with_task(
-            model=dummy_model, prompts=prompts, task_config=task_config, temperature=1.0
-        )
-
-        # Verify outputs have valid shape and content
-        assert outputs.shape[1] >= S
-        assert torch.all(outputs >= 0)
-        assert torch.all(outputs < dummy_model.vocab_size)
-
-        # For EOS-based generation, verify it stops at EOS
-        if expected_eos_tokens:
-            for seq in outputs:
-                # Find first EOS token
-                eos_positions = [i for i, t in enumerate(seq) if t in expected_eos_tokens]
-                if eos_positions:
-                    first_eos = min(eos_positions)
-                    # Verify no generation after first EOS
-                    assert len(seq) == first_eos + 1, "Generation continued after EOS token"
-
-    finally:
-        config_path.unlink()  # Cleanup temp file
+    # Check token patterns
+    assert sequences[0, -1] == 4  # Ends with death
+    assert sequences[1, -1] == 3  # Ends with discharge
+    assert sequences[2, 2] == 1  # Failed on readmission
 
 
-def test_icu_mortality(dummy_model, base_token_map, icu_mortality_yaml):
-    """Test ICU mortality prediction task."""
-    test_generation_case(
-        yaml_str=icu_mortality_yaml,
-        token_map=base_token_map,
-        expected_eos_tokens=[1, 2],  # death or discharge
-        expected_budget_type="eos_only",
-        expected_budget_value=None,
-        expected_target_codes=[1],  # death only
-        dummy_model=dummy_model,
-    )
+def test_time_edge_cases():
+    """Test sequences with events exactly at window boundaries."""
+    # TODO: Add tests for:
+    # - Events exactly at 24h boundary
+    # - Events exactly at 48h boundary
+    # - Events just inside/outside boundaries
 
 
-def test_lab_value_prediction(dummy_model, base_token_map, lab_value_yaml):
-    """Test lab value prediction with time window."""
-    test_generation_case(
-        yaml_str=lab_value_yaml,
-        token_map=base_token_map,
-        expected_eos_tokens=[],  # No EOS tokens, time-based
-        expected_budget_type="time",
-        expected_budget_value=24.0,
-        expected_target_codes=[3],  # lab_result token
-        dummy_model=dummy_model,
-    )
+def test_budget_interactions():
+    """Test interaction between budget and task constraints."""
+    # TODO: Add tests for:
+    # - Max sequence length reached before conclusion
+    # - Max time reached before conclusion
+    # - Budget hit after task already determined
 
 
-def test_medication_prediction(dummy_model, base_token_map, medication_yaml):
-    """Test medication prediction with complex derived predicates."""
-    test_generation_case(
-        yaml_str=medication_yaml,
-        token_map=base_token_map,
-        expected_eos_tokens=[4],  # medication token
-        expected_budget_type="eos_only",
-        expected_budget_value=None,
-        expected_target_codes=[4],  # medication token
-        dummy_model=dummy_model,
-    )
+def test_batch_processing():
+    """Test batch processing with mixed sequence statuses."""
+    # TODO: Add tests for:
+    # - Sequences finishing at different times
+    # - Some sequences hitting budget while others complete normally
+    # - All sequences completing simultaneously
