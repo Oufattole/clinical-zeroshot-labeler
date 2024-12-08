@@ -239,7 +239,7 @@ def generate_sequences(
     task_config: "ZeroShotTaskConfig",
     temperature: float = 1.0,
     budget: GenerationBudget | None = None,
-    get_next_token_time: callable | None = None,
+    get_next_token_time: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Generate sequences using task configuration for stopping criteria.
 
