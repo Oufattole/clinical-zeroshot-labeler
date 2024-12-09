@@ -3,7 +3,7 @@ import tempfile
 import pytest
 import torch
 
-from czsl.labeler import create_zero_shot_task, generate
+from czsl.labeler import TaskExtractorConfig, ZeroShotTaskConfig, generate
 
 
 class DummyModel:
@@ -25,19 +25,11 @@ class DummyModel:
                 tokens.append(seq[self.current_positions[i]][0])
                 self.current_positions[i] += 1
             else:
-                tokens.append(0)  # pad token
-        return torch.tensor(tokens, device=prompts.device)
-
-    def get_next_token_time(self, token: torch.Tensor) -> torch.Tensor:
-        """Return time for each token."""
-        times = []
-        for i, seq in enumerate(self.sequences):
-            pos = self.current_positions[i] - 1  # already incremented
-            if pos < len(seq):
-                times.append(seq[pos][1])
-            else:
-                times.append(0.0)
-        return torch.tensor(times, device=token.device)
+                raise ValueError("Sequence is exhausted, zero_shot_labeler should have stopped generation.")
+        next_codes = torch.tensor(tokens, device=prompts.device)
+        next_times = torch.ones_like(next_codes) / 365
+        next_numeric_values = torch.zeros_like(next_codes)
+        return next_codes, next_times, next_numeric_values
 
 
 @pytest.fixture
@@ -150,7 +142,9 @@ def test_basic_task_outcomes(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
         f.write(task_config_yaml)
         f.flush()
-        task_config = create_zero_shot_task(f.name, token_map)
+        task_config = TaskExtractorConfig.load(f.name)
+
+    zs_task_config = ZeroShotTaskConfig(task_config, token_map, max_seq_len=10)
 
     # Create model with test sequences
     test_sequences = [
@@ -166,7 +160,16 @@ def test_basic_task_outcomes(
     prompts = torch.zeros((batch_size, 1), dtype=torch.long)
 
     # Generate sequences
-    sequences, satisfied, impossible = generate(model=model, prompts=prompts, task_config=task_config)
+    generation_output = generate(
+        model=model,
+        prompts=prompts,
+        zs_task_config=zs_task_config,
+        end_time_delta=torch.zeros((batch_size), dtype=torch.float32),
+    )
+    sequences = generation_output.sequences
+    satisfied = generation_output.satisfied
+    impossible = generation_output.impossible
+    _ = generation_output.times
 
     # Check outcomes
     assert satisfied[0]  # Death sequence succeeded
