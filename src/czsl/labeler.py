@@ -171,12 +171,11 @@ class WindowNode:
         if isinstance(self.end_bound, TemporalBound):
             return state.end_time is not None
         else:
-            return any(
-                [
-                    int(event_token) in self.end_bound.predicate
-                    for event_token in state.predicate_counts.keys()
-                ]
-            )
+            if isinstance(self.end_bound.predicate, str):
+                predicate = [int(self.end_bound.predicate)]
+            else:
+                predicate = self.end_bound.predicate
+            return any([int(event_token) in predicate for event_token in state.predicate_counts.keys()])
 
     def _check_constraints_impossible(self, state: WindowState) -> bool:
         """Check if constraints are impossible to satisfy."""
