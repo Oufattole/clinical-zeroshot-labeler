@@ -4,6 +4,7 @@ from enum import Enum
 from typing import Literal, Optional
 
 import torch
+from loguru import logger
 
 from czsl.config import TaskExtractorConfig, TemporalWindowBounds, ToEventWindowBounds
 
@@ -72,9 +73,20 @@ class WindowNode:
     start_bound: TemporalBound | EventBound
     end_bound: TemporalBound | EventBound
     predicate_constraints: dict[str, tuple[int | None, int | None]]
+    label: str | None
+    index_timestamp: str | None
     parent: Optional["WindowNode"] = None
     children: list["WindowNode"] = field(default_factory=list)
     batch_states: list[WindowState] = field(default_factory=list)
+    ignore: bool = False
+
+    def ignore_windows(self, window_names: list[str]):
+        if self.name in window_names:
+            self.ignore = True
+            for each in self.batch_states:
+                each.status = WindowStatus.SATISFIED
+        for child in self.children:
+            child.ignore_windows(window_names)
 
     def initialize_batch(self, batch_size: int):
         """Initialize batch states."""
@@ -89,6 +101,7 @@ class WindowNode:
         """Check if window should start at current time/event."""
         # Parse reference point
         ref_time = 0.0  # Default to trigger time
+        logger.warning(f"self.name: {self.name}")
         if self.start_bound.reference != "trigger":
             if not parent_state:
                 return False
@@ -190,58 +203,62 @@ class WindowNode:
         self, batch_idx: int, time_delta: float, event_token: int, parent_state: WindowState | None = None
     ) -> WindowStatus:
         """Update state for specific batch element."""
+        if self.ignore:
+            return WindowStatus.SATISFIED
         state = self.batch_states[batch_idx]
 
-        print(f"Node {self.name} updating batch {batch_idx}:")
-        print(f"  token: {event_token}, time: {time_delta}")
-        print(f"  current state: start={state.start_time}, end={state.end_time}, in_window={state.in_window}")
+        logger.info(f"Node {self.name} updating batch {batch_idx}:")
+        logger.info(f"  token: {event_token}, time: {time_delta}")
+        logger.info(
+            f"  current state: start={state.start_time}, end={state.end_time}, in_window={state.in_window}"
+        )
 
         # If already satisfied or impossible, don't update
         if state.status in (WindowStatus.SATISFIED, WindowStatus.IMPOSSIBLE):
-            print(f"  skipping - already {state.status}")
+            logger.info(f"  skipping - already {state.status}")
             return state.status
 
         # Check window start if not started
         if not state.start_time and self._check_start_condition(time_delta, event_token, parent_state):
             state.start_time = time_delta
             state.in_window = True
-            print(f"  window started at {time_delta}")
+            logger.info(f"  window started at {time_delta}")
 
         # Update counts if in window
         if state.in_window:
             self._update_counts(state, event_token)
             state.status = WindowStatus.ACTIVE
-            print(f"  updated counts: {state.predicate_counts}")
+            logger.info(f"  updated counts: {state.predicate_counts}")
 
             # Check if constraints satisfied
             if self._check_constraints_satisfied(state):
                 state.status = WindowStatus.SATISFIED
                 state.in_window = False  # Close window once satisfied
-                print("  constraints satisfied")
+                logger.info("  constraints satisfied")
                 return state.status
 
             # Check if constraints now impossible
             if self._check_constraints_impossible(state):
                 state.status = WindowStatus.IMPOSSIBLE
                 state.in_window = False
-                print("  constraints impossible")
+                logger.info("  constraints impossible")
                 return state.status
 
         # Check window end
         if state.in_window and self._check_end_condition(time_delta, event_token):
             state.end_time = time_delta
             state.in_window = False
-            print(f"  window ended at {time_delta}")
+            logger.info(f"  window ended at {time_delta}")
 
             # Final constraint check at window end
             if self._check_constraints_satisfied(state):
                 state.status = WindowStatus.SATISFIED
-                print("  constraints satisfied")
+                logger.info("  constraints satisfied")
             else:
                 state.status = WindowStatus.IMPOSSIBLE
-                print("  constraints impossible - window ended")
+                logger.info("  constraints impossible - window ended")
 
-        print(f"  final status: {state.status}")
+        logger.info(f"  final status: {state.status}")
         return state.status
 
 
@@ -287,6 +304,82 @@ class AutoregressiveWindowTree:
         return torch.tensor([s.value for s in results])
 
 
+def calculate_index_timestamp_info(tree: AutoregressiveWindowTree) -> tuple[float, list[str], str]:
+    """Calculate the temporal gap and identify windows prior to the index timestamp.
+
+    The function traverses the tree to find the node with an index_timestamp,
+    calculates the temporal offset to the trigger, and identifies all windows
+    that must be processed before reaching the index timestamp.
+
+    Args:
+        tree: AutoregressiveWindowTree containing the window nodes
+
+    Returns:
+        TimestampInfo containing:
+            - gap_days: temporal gap in days between index timestamp and trigger
+            - prior_windows: list of window names that come before the index timestamp
+            - index_window: name of the window containing the index timestamp
+
+    Raises:
+        ValueError: If no index timestamp is found or if multiple index timestamps exist
+    """
+
+    def find_index_timestamp_node(node: WindowNode) -> tuple[WindowNode, str] | None:
+        """Recursively find the node with an index_timestamp.
+        Returns tuple of (node, timestamp_type) where timestamp_type is 'start' or 'end'."""
+        # Check current node
+        if node.index_timestamp is not None:
+            if node.index_timestamp not in ["start", "end"]:
+                raise ValueError(f"Invalid index_timestamp value: {node.index_timestamp}")
+            return (node, node.index_timestamp)
+
+        # Check children recursively
+        for child in node.children:
+            result = find_index_timestamp_node(child)
+            if result is not None:
+                return result
+
+        return None
+
+    # Find node with index timestamp
+    result = find_index_timestamp_node(tree.root)
+    if result is None:
+        raise ValueError("No index timestamp found in tree")
+
+    index_node, timestamp_type = result
+    total_offset_days = 0.0
+    prior_windows = []
+
+    # Follow path back to trigger, accumulating temporal offsets and windows
+    current_node = index_node
+    while current_node is not None and current_node.name != "trigger":
+        # Add current window to prior windows if it's not the index window
+        # or if we're looking at its start time and the index is at its end
+        if current_node != index_node or (current_node == index_node and timestamp_type == "end"):
+            prior_windows.append(current_node.name)
+
+        bound = current_node.start_bound if timestamp_type == "start" else current_node.end_bound
+
+        # Verify it's a temporal bound
+        if bound.bound_type != BoundType.TEMPORAL:
+            raise ValueError(f"Non-temporal bound found in path to trigger for node {current_node.name}")
+
+        # Add the offset in days
+        offset_days = bound.offset.total_seconds() / (24 * 3600)
+        total_offset_days += offset_days
+
+        # Move to parent
+        current_node = current_node.parent
+
+        # If moving to parent, we're now looking at the start bound
+        timestamp_type = "start"
+
+    # Reverse the list since we collected windows from index back to trigger
+    prior_windows.reverse()
+
+    return total_offset_days, prior_windows, index_node.name
+
+
 def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> AutoregressiveWindowTree:
     """Convert TaskExtractorConfig to AutoregressiveWindowTree.
 
@@ -303,6 +396,8 @@ def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> Autoreg
         start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
         end_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
         predicate_constraints={config.trigger.predicate: (1, 1)},
+        label=None,
+        index_timestamp=None,
     )
 
     def convert_endpoint_expr(
@@ -317,7 +412,6 @@ def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> Autoreg
                 TemporalBound(reference=window_name, inclusive=expr.left_inclusive, offset=expr.window_size),
                 window_name,
             )
-
         else:  # ToEventWindowBounds
             direction = "previous" if expr.end_event.startswith("-") else "next"
             predicate = expr.end_event.lstrip("-")
@@ -336,18 +430,30 @@ def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> Autoreg
     all_nodes = {"trigger": root}
     for window_name, window in config.windows.items():
         # Convert start/end expressions
-        if window.root_node == "start":
-            # Window defined from start forward
-            start_bound, start_ref = convert_endpoint_expr(window.start_endpoint_expr, f"{window_name}.start")
-            end_bound, end_ref = convert_endpoint_expr(window.end_endpoint_expr, f"{window_name}.end")
-        else:
-            # Window defined from end backward
-            start_bound, start_ref = convert_endpoint_expr(window.start_endpoint_expr, f"{window_name}.start")
-            end_bound, end_ref = convert_endpoint_expr(window.end_endpoint_expr, f"{window_name}.end")
+        start_bound, start_ref = convert_endpoint_expr(window.start_endpoint_expr, f"{window_name}.start")
+        end_bound, end_ref = convert_endpoint_expr(window.end_endpoint_expr, f"{window_name}.end")
 
         # Create window node with converted bounds
+        if start_bound is None:
+            parent_window_name, start_or_end = window.start.split(".")
+            if start_or_end == "start":
+                start_bound = all_nodes[parent_window_name].start_bound
+            elif start_or_end == "end":
+                start_bound = all_nodes[parent_window_name].end_bound
+        if end_bound is None:
+            parent_window_name, start_or_end = window.start.split(".")
+            if start_or_end == "start":
+                start_bound = all_nodes[parent_window_name].start_bound
+            elif start_or_end == "end":
+                start_bound = all_nodes[parent_window_name].end_bound
+
         node = WindowNode(
-            name=window_name, start_bound=start_bound, end_bound=end_bound, predicate_constraints=window.has
+            name=window_name,
+            start_bound=start_bound,
+            end_bound=end_bound,
+            predicate_constraints=window.has,
+            label=window.label,
+            index_timestamp=window.index_timestamp,
         )
         all_nodes[window_name] = node
 
@@ -363,5 +469,4 @@ def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> Autoreg
 
     # Create tree from root
     tree = AutoregressiveWindowTree(root, batch_size)
-
     return tree
