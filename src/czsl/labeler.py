@@ -179,10 +179,17 @@ class WindowNode:
             state.predicate_counts[token_str] = 0
         state.predicate_counts[token_str] += 1
 
+    def _get_count(self, predicate_id: str, state: WindowState) -> int:
+        predicate_tensor = self.tensorized_predicates[predicate_id]
+        count = 0
+        for each in predicate_tensor:
+            count += state.predicate_counts.get(str(each.item()), 0)
+        return count
+
     def _check_constraints_satisfied(self, state: WindowState) -> bool:
         """Check if all predicate constraints are satisfied."""
         for pred, (min_count, max_count) in self.predicate_constraints.items():
-            count = state.predicate_counts.get(pred, 0)
+            count = self._get_count(pred, state)
 
             # Must meet minimum count
             if min_count is not None and count < min_count:
@@ -208,10 +215,7 @@ class WindowNode:
     def _check_constraints_impossible(self, state: WindowState) -> bool:
         """Check if constraints are impossible to satisfy."""
         for pred, (min_count, max_count) in self.predicate_constraints.items():
-            predicate_tensor = self.tensorized_predicates[pred]
-            count = 0
-            for each in predicate_tensor:
-                count += state.predicate_counts.get(str(each.item()), 0)
+            count = self._get_count(pred, state)
 
             # If we've exceeded max count
             if max_count is not None and count > max_count:

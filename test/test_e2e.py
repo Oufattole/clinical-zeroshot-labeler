@@ -229,7 +229,7 @@ def test_window_tree():
         name="observation",
         start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
         end_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(hours=24)),
-        predicate_constraints={"2": (1, None)},  # Lab test token = 2
+        predicate_constraints={"Lab": (1, None)},  # Lab test token = 2
         parent=root,
         index_timestamp=None,
         label=None,
@@ -258,6 +258,7 @@ def test_window_tree():
     logger.info("\n=== Test Step 1: Admission events ===")
     status = tracker.update(tokens=torch.tensor([1, 1]), time_deltas=torch.tensor([0.0, 0.0]))
     logger.info(f"Expecting: Both sequences start, trigger satisfied. Status is: {status}")
+    print_window_tree_with_state(tracker.root)
     assert (status == torch.ones_like(status)).all()
 
     logger.info("\n=== Test Step 2: Lab test vs other event ===")
