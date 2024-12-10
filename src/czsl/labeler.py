@@ -5,6 +5,8 @@ from typing import Literal, Optional
 
 import torch
 
+from czsl.config import TaskExtractorConfig, TemporalWindowBounds, ToEventWindowBounds
+
 
 class WindowStatus(Enum):
     UNDETERMINED = 0
@@ -283,3 +285,83 @@ class AutoregressiveWindowTree:
             results.append(status)
 
         return torch.tensor([s.value for s in results])
+
+
+def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> AutoregressiveWindowTree:
+    """Convert TaskExtractorConfig to AutoregressiveWindowTree.
+
+    Args:
+        config: Task configuration from ACES
+        batch_size: Size of batches for constraint tracking
+
+    Returns:
+        AutoregressiveWindowTree configured according to task config
+    """
+    # 1. Create trigger/root node
+    root = WindowNode(
+        name="trigger",
+        start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
+        end_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
+        predicate_constraints={config.trigger.predicate: (1, 1)},
+    )
+
+    def convert_endpoint_expr(
+        expr: ToEventWindowBounds | TemporalWindowBounds | None, window_name: str
+    ) -> tuple[TemporalBound | EventBound, str]:
+        """Convert ACES endpoint expression to our bound type."""
+        if expr is None:
+            return None, None
+
+        if isinstance(expr, TemporalWindowBounds):
+            return (
+                TemporalBound(reference=window_name, inclusive=expr.left_inclusive, offset=expr.window_size),
+                window_name,
+            )
+
+        else:  # ToEventWindowBounds
+            direction = "previous" if expr.end_event.startswith("-") else "next"
+            predicate = expr.end_event.lstrip("-")
+
+            return (
+                EventBound(
+                    reference=window_name,
+                    inclusive=expr.left_inclusive,
+                    predicate=predicate,
+                    direction=direction,
+                ),
+                window_name,
+            )
+
+    # 2. Process each window definition and create nodes
+    all_nodes = {"trigger": root}
+    for window_name, window in config.windows.items():
+        # Convert start/end expressions
+        if window.root_node == "start":
+            # Window defined from start forward
+            start_bound, start_ref = convert_endpoint_expr(window.start_endpoint_expr, f"{window_name}.start")
+            end_bound, end_ref = convert_endpoint_expr(window.end_endpoint_expr, f"{window_name}.end")
+        else:
+            # Window defined from end backward
+            start_bound, start_ref = convert_endpoint_expr(window.start_endpoint_expr, f"{window_name}.start")
+            end_bound, end_ref = convert_endpoint_expr(window.end_endpoint_expr, f"{window_name}.end")
+
+        # Create window node with converted bounds
+        node = WindowNode(
+            name=window_name, start_bound=start_bound, end_bound=end_bound, predicate_constraints=window.has
+        )
+        all_nodes[window_name] = node
+
+        # Set up parent relationship
+        if window.referenced_event[0] == "trigger":
+            root.children.append(node)
+            node.parent = root
+        else:
+            parent_window = window.referenced_event[0]
+            parent_node = all_nodes[parent_window]
+            parent_node.children.append(node)
+            node.parent = parent_node
+
+    # Create tree from root
+    tree = AutoregressiveWindowTree(root, batch_size)
+
+    return tree
