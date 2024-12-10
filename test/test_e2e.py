@@ -210,13 +210,19 @@ def undetermined_sequence():
 def test_window_tree():
     """Test the window tree implementation."""
     # Create tree for in-hospital mortality prediction
+    tensorized_predicates = {
+        "Admission": torch.tensor([1]),
+        "Lab": torch.tensor([2]),
+        "Death": torch.tensor([3]),
+    }
     root = WindowNode(
         name="trigger",
         start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
         end_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
-        predicate_constraints={"1": (1, 1)},  # Admission token = 1
+        predicate_constraints={"Admission": (1, 1)},  # Admission token = 1
         index_timestamp=None,
         label=None,
+        tensorized_predicates=tensorized_predicates,
     )
 
     obs_window = WindowNode(
@@ -227,6 +233,7 @@ def test_window_tree():
         parent=root,
         index_timestamp=None,
         label=None,
+        tensorized_predicates=tensorized_predicates,
     )
     root.children.append(obs_window)
 
@@ -240,6 +247,7 @@ def test_window_tree():
         parent=obs_window,
         index_timestamp=None,
         label=None,
+        tensorized_predicates=tensorized_predicates,
     )
     obs_window.children.append(outcome_window)
 

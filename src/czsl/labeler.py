@@ -23,6 +23,8 @@ def get_predicate_tensor(metadata_df: pl.DataFrame, config: TaskExtractorConfig,
     if isinstance(predicate, PlainPredicateConfig):
         predicate_tensor = metadata_df.filter(predicate.MEDS_eval_expr())["code/vocab_index"].to_torch()
     elif isinstance(predicate, DerivedPredicateConfig):
+        if predicate.is_and:
+            raise NotImplementedError("AND predicates not yet supported")
         predicates = predicate.input_predicates
         predicate_tensor = torch.concat(
             [
@@ -101,12 +103,11 @@ class WindowNode:
     predicate_constraints: dict[str, tuple[int | None, int | None]]
     label: str | None
     index_timestamp: str | None
+    tensorized_predicates: dict[str, torch.Tensor]
     parent: Optional["WindowNode"] = None
     children: list["WindowNode"] = field(default_factory=list)
     batch_states: list[WindowState] = field(default_factory=list)
     ignore: bool = False
-    config: TaskExtractorConfig | None = None
-    metadata_df: pl.DataFrame | None = None
 
     def ignore_windows(self, window_names: list[str]):
         if self.name in window_names:
@@ -207,7 +208,7 @@ class WindowNode:
     def _check_constraints_impossible(self, state: WindowState) -> bool:
         """Check if constraints are impossible to satisfy."""
         for pred, (min_count, max_count) in self.predicate_constraints.items():
-            predicate_tensor = get_predicate_tensor(self.metadata_df, self.config, pred)
+            predicate_tensor = self.tensorized_predicates[pred]
             count = 0
             for each in predicate_tensor:
                 count += state.predicate_counts.get(str(each.item()), 0)
@@ -415,6 +416,9 @@ def convert_task_config(
     Returns:
         AutoregressiveWindowTree configured according to task config
     """
+    # 0. Precache tensorized predicates
+    tensorized_predicates = {p: get_predicate_tensor(metadata_df, config, p) for p in config.predicates}
+
     # 1. Create trigger/root node
     root = WindowNode(
         name="trigger",
@@ -423,8 +427,7 @@ def convert_task_config(
         predicate_constraints={config.trigger.predicate: (1, 1)},
         label=None,
         index_timestamp=None,
-        config=config,
-        metadata_df=metadata_df,
+        tensorized_predicates=tensorized_predicates,
     )
 
     def convert_endpoint_expr(
@@ -445,22 +448,8 @@ def convert_task_config(
         else:  # ToEventWindowBounds
             direction = "previous" if expr.end_event.startswith("-") else "next"
             predicate = expr.end_event.lstrip("-")
-            # For now we only support an or predicate
             if predicate not in [END_OF_RECORD_KEY, START_OF_RECORD_KEY]:
-                if isinstance(config.predicates[predicate], PlainPredicateConfig):
-                    raise ValueError(f"Plain predicate {predicate} not supported yet")
-                elif isinstance(config.predicates[predicate], DerivedPredicateConfig):
-                    predicates = config.predicates[predicate].input_predicates
-                    predicate = torch.concat(
-                        [
-                            metadata_df.filter(config.plain_predicates[p].MEDS_eval_expr())[
-                                "code/vocab_index"
-                            ].to_torch()
-                            for p in predicates
-                        ]
-                    )
-                else:
-                    raise ValueError(f"Unsupported predicate type: {type(config.predicates[predicate])}")
+                predicate = get_predicate_tensor(metadata_df, config, predicate)
 
             return (
                 EventBound(
@@ -504,8 +493,7 @@ def convert_task_config(
             predicate_constraints=window.has,
             label=window.label,
             index_timestamp=window.index_timestamp,
-            config=config,
-            metadata_df=metadata_df,
+            tensorized_predicates=tensorized_predicates,
         )
         all_nodes[window_name] = node
 
