@@ -7,7 +7,32 @@ import polars as pl
 import torch
 from loguru import logger
 
-from czsl.config import TaskExtractorConfig, TemporalWindowBounds, ToEventWindowBounds
+from czsl.config import (
+    END_OF_RECORD_KEY,
+    START_OF_RECORD_KEY,
+    DerivedPredicateConfig,
+    PlainPredicateConfig,
+    TaskExtractorConfig,
+    TemporalWindowBounds,
+    ToEventWindowBounds,
+)
+
+
+def get_predicate_tensor(metadata_df: pl.DataFrame, config: TaskExtractorConfig, predicate_name: str):
+    predicate = config.predicates[predicate_name]
+    if isinstance(predicate, PlainPredicateConfig):
+        predicate_tensor = metadata_df.filter(predicate.MEDS_eval_expr())["code/vocab_index"].to_torch()
+    elif isinstance(predicate, DerivedPredicateConfig):
+        predicates = predicate.input_predicates
+        predicate_tensor = torch.concat(
+            [
+                metadata_df.filter(config.plain_predicates[p].MEDS_eval_expr())["code/vocab_index"].to_torch()
+                for p in predicates
+            ]
+        )
+    else:
+        raise ValueError(f"Unknown predicate type {type(predicate)}")
+    return predicate_tensor
 
 
 class WindowStatus(Enum):
@@ -80,6 +105,8 @@ class WindowNode:
     children: list["WindowNode"] = field(default_factory=list)
     batch_states: list[WindowState] = field(default_factory=list)
     ignore: bool = False
+    config: TaskExtractorConfig | None = None
+    metadata_df: pl.DataFrame | None = None
 
     def ignore_windows(self, window_names: list[str]):
         if self.name in window_names:
@@ -180,7 +207,10 @@ class WindowNode:
     def _check_constraints_impossible(self, state: WindowState) -> bool:
         """Check if constraints are impossible to satisfy."""
         for pred, (min_count, max_count) in self.predicate_constraints.items():
-            count = state.predicate_counts.get(pred, 0)
+            predicate_tensor = get_predicate_tensor(self.metadata_df, self.config, pred)
+            count = 0
+            for each in predicate_tensor:
+                count += state.predicate_counts.get(str(each.item()), 0)
 
             # If we've exceeded max count
             if max_count is not None and count > max_count:
@@ -393,6 +423,8 @@ def convert_task_config(
         predicate_constraints={config.trigger.predicate: (1, 1)},
         label=None,
         index_timestamp=None,
+        config=config,
+        metadata_df=metadata_df,
     )
 
     def convert_endpoint_expr(
@@ -414,13 +446,6 @@ def convert_task_config(
             direction = "previous" if expr.end_event.startswith("-") else "next"
             predicate = expr.end_event.lstrip("-")
             # For now we only support an or predicate
-            from czsl.config import (
-                END_OF_RECORD_KEY,
-                START_OF_RECORD_KEY,
-                DerivedPredicateConfig,
-                PlainPredicateConfig,
-            )
-
             if predicate not in [END_OF_RECORD_KEY, START_OF_RECORD_KEY]:
                 if isinstance(config.predicates[predicate], PlainPredicateConfig):
                     raise ValueError(f"Plain predicate {predicate} not supported yet")
@@ -479,6 +504,8 @@ def convert_task_config(
             predicate_constraints=window.has,
             label=window.label,
             index_timestamp=window.index_timestamp,
+            config=config,
+            metadata_df=metadata_df,
         )
         all_nodes[window_name] = node
 
