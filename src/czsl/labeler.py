@@ -3,6 +3,7 @@ from datetime import timedelta
 from enum import Enum
 from typing import Literal, Optional
 
+import polars as pl
 import torch
 from loguru import logger
 
@@ -95,25 +96,10 @@ class WindowNode:
         for child in self.children:
             child.initialize_batch(batch_size)
 
-    def _check_start_condition(
-        self, time_delta: float, event_token: int, parent_state: WindowState | None = None
-    ) -> bool:
+    def _check_start_condition(self, time_delta: float, event_token: int, batch_idx: int) -> bool:
         """Check if window should start at current time/event."""
         # Parse reference point
         ref_time = 0.0  # Default to trigger time
-        logger.warning(f"self.name: {self.name}")
-        if self.start_bound.reference != "trigger":
-            if not parent_state:
-                return False
-            # Get time from parent window
-            window_name, point = self.start_bound.reference.split(".")
-            if point == "start":
-                ref_time = parent_state.start_time
-            else:  # end
-                ref_time = parent_state.end_time
-
-            if ref_time is None:
-                return False
 
         # Check based on bound type
         if self.start_bound.bound_type == BoundType.TEMPORAL:
@@ -182,7 +168,15 @@ class WindowNode:
             return True
 
         # For other windows, need to wait for window end
-        return state.end_time is not None
+        if isinstance(self.end_bound, TemporalBound):
+            return state.end_time is not None
+        else:
+            return any(
+                [
+                    int(event_token) in self.end_bound.predicate
+                    for event_token in state.predicate_counts.keys()
+                ]
+            )
 
     def _check_constraints_impossible(self, state: WindowState) -> bool:
         """Check if constraints are impossible to satisfy."""
@@ -219,7 +213,7 @@ class WindowNode:
             return state.status
 
         # Check window start if not started
-        if not state.start_time and self._check_start_condition(time_delta, event_token, parent_state):
+        if not state.start_time and self._check_start_condition(time_delta, event_token, batch_idx):
             state.start_time = time_delta
             state.in_window = True
             logger.info(f"  window started at {time_delta}")
@@ -380,7 +374,9 @@ def calculate_index_timestamp_info(tree: AutoregressiveWindowTree) -> tuple[floa
     return total_offset_days, prior_windows, index_node.name
 
 
-def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> AutoregressiveWindowTree:
+def convert_task_config(
+    config: TaskExtractorConfig, batch_size: int, metadata_df: pl.DataFrame
+) -> AutoregressiveWindowTree:
     """Convert TaskExtractorConfig to AutoregressiveWindowTree.
 
     Args:
@@ -401,7 +397,10 @@ def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> Autoreg
     )
 
     def convert_endpoint_expr(
-        expr: ToEventWindowBounds | TemporalWindowBounds | None, window_name: str
+        config: TaskExtractorConfig,
+        metadata_df: pl.DataFrame,
+        expr: ToEventWindowBounds | TemporalWindowBounds | None,
+        window_name: str,
     ) -> tuple[TemporalBound | EventBound, str]:
         """Convert ACES endpoint expression to our bound type."""
         if expr is None:
@@ -415,6 +414,29 @@ def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> Autoreg
         else:  # ToEventWindowBounds
             direction = "previous" if expr.end_event.startswith("-") else "next"
             predicate = expr.end_event.lstrip("-")
+            # For now we only support an or predicate
+            from czsl.config import (
+                END_OF_RECORD_KEY,
+                START_OF_RECORD_KEY,
+                DerivedPredicateConfig,
+                PlainPredicateConfig,
+            )
+
+            if predicate not in [END_OF_RECORD_KEY, START_OF_RECORD_KEY]:
+                if isinstance(config.predicates[predicate], PlainPredicateConfig):
+                    raise ValueError(f"Plain predicate {predicate} not supported yet")
+                elif isinstance(config.predicates[predicate], DerivedPredicateConfig):
+                    predicates = config.predicates[predicate].input_predicates
+                    predicate = torch.concat(
+                        [
+                            metadata_df.filter(config.plain_predicates[p].MEDS_eval_expr())[
+                                "code/vocab_index"
+                            ].to_torch()
+                            for p in predicates
+                        ]
+                    )
+                else:
+                    raise ValueError(f"Unsupported predicate type: {type(config.predicates[predicate])}")
 
             return (
                 EventBound(
@@ -430,8 +452,12 @@ def convert_task_config(config: TaskExtractorConfig, batch_size: int) -> Autoreg
     all_nodes = {"trigger": root}
     for window_name, window in config.windows.items():
         # Convert start/end expressions
-        start_bound, start_ref = convert_endpoint_expr(window.start_endpoint_expr, f"{window_name}.start")
-        end_bound, end_ref = convert_endpoint_expr(window.end_endpoint_expr, f"{window_name}.end")
+        start_bound, start_ref = convert_endpoint_expr(
+            config, metadata_df, window.start_endpoint_expr, f"{window_name}.start"
+        )
+        end_bound, end_ref = convert_endpoint_expr(
+            config, metadata_df, window.end_endpoint_expr, f"{window_name}.end"
+        )
 
         # Create window node with converted bounds
         if start_bound is None:

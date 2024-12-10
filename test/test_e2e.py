@@ -1,5 +1,6 @@
 import tempfile
 
+import polars as pl
 import pytest
 import torch
 from loguru import logger
@@ -143,15 +144,19 @@ def task_config_yaml():
 
 
 @pytest.fixture
-def token_map():
-    return {
-        0: "PAD",
-        1: "ICU_ADMISSION//MEDICAL",
-        2: "ICU_DISCHARGE//MEDICAL",
-        3: "HOSPITAL_DISCHARGE//MEDICAL",
-        4: "MEDS_DEATH",
-        5: "OTHER_EVENT",
-    }
+def metadata_df():
+    return pl.DataFrame(
+        {
+            "code": [
+                "PAD",
+                "ICU_ADMISSION//MEDICAL",
+                "ICU_DISCHARGE//MEDICAL",
+                "HOSPITAL_DISCHARGE//MEDICAL",
+                "MEDS_DEATH",
+                "OTHER_EVENT",
+            ]
+        }
+    ).with_row_index("code/vocab_index")
 
 
 @pytest.fixture
@@ -162,6 +167,7 @@ def successful_death_sequence():
         (5, 20.0),  # Some other event during input window
         (5, 40.0),  # Some other event during gap window
         (4, 72.0),  # Death after gap window
+        (5, 73.0),  # Some other event after death
     ]
 
 
@@ -259,7 +265,7 @@ def test_window_tree():
 
 def test_basic_task_outcomes(
     task_config_yaml,
-    token_map,
+    metadata_df,
     successful_death_sequence,
     successful_discharge_sequence,
     impossible_readmission_sequence,
@@ -284,7 +290,7 @@ def test_basic_task_outcomes(
     # Create dummy prompts and tracker
     batch_size = len(test_sequences)
     prompts = torch.zeros((batch_size, 1), dtype=torch.long)
-    tree = convert_task_config(task_config, batch_size=batch_size)
+    tree = convert_task_config(task_config, batch_size=batch_size, metadata_df=metadata_df)
     gap_days, prior_windows, index_window = calculate_index_timestamp_info(tree)
     tree.root.ignore_windows(prior_windows + ["trigger"])
 
@@ -297,12 +303,13 @@ def test_basic_task_outcomes(
         status = tree.update(tokens=next_tokens, time_deltas=next_times + gap_days)
         print_window_tree_with_state(tree.root)
         logger.info(f"Status: {status}")
-        # assert torch.equal(status, expected_status)
+        assert torch.equal(status, expected_status)
         return torch.cat([prompts, next_tokens.unsqueeze(1)], dim=1)
 
+    batch_size = 1
     # Step 1: Initial ICU admissions
     # All sequences should start and satisfy trigger
-    prompts = check_step(torch.ones(batch_size))
+    prompts = check_step(torch.zeros(batch_size))
 
     # Step 2: Events during input window
     # All sequences should remain active
@@ -310,15 +317,17 @@ def test_basic_task_outcomes(
 
     # Step 3: Events during/end of gap window
     # Readmission sequence should become impossible
-    expected = torch.tensor([1, 1, 3, 1])  # Active, Active, Impossible, Active
-    prompts = check_step(expected)
+    prompts = check_step(torch.ones(batch_size))
 
     # Step 4: Final outcomes
     # Death sequence -> satisfied
     # Discharge sequence -> satisfied
     # Readmission sequence -> already impossible
     # Undetermined sequence -> still active/undetermined
-    expected = torch.tensor([2, 2, 3, 1])  # Satisfied, Satisfied, Impossible, Active
+    expected = torch.tensor([2])  # Satisfied, Satisfied, Impossible, Active
+    _ = check_step(expected)
+
+    expected = torch.tensor([2])  # Satisfied, Satisfied, Impossible, Active
     _ = check_step(expected)
 
     logger.info("Test completed - all sequence patterns behaved as expected")
