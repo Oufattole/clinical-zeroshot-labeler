@@ -468,6 +468,7 @@ def convert_task_config(
     # 2. Process each window definition and create nodes
     all_nodes = {"trigger": root}
     for window_name, window in config.windows.items():
+        logger.info(f"Processing window {window_name}")
         # Convert start/end expressions
         start_bound, start_ref = convert_endpoint_expr(
             config, metadata_df, window.start_endpoint_expr, f"{window_name}.start"
@@ -484,11 +485,14 @@ def convert_task_config(
             elif start_or_end == "end":
                 start_bound = all_nodes[parent_window_name].end_bound
         if end_bound is None:
-            parent_window_name, start_or_end = window.start.split(".")
-            if start_or_end == "start":
-                start_bound = all_nodes[parent_window_name].start_bound
-            elif start_or_end == "end":
-                start_bound = all_nodes[parent_window_name].end_bound
+            if window.end == "trigger":
+                end_bound = root.end_bound
+            else:
+                parent_window_name, start_or_end = window.end.split(".")
+                if start_or_end == "start":
+                    end_bound = all_nodes[parent_window_name].start_bound
+                elif start_or_end == "end":
+                    end_bound = all_nodes[parent_window_name].end_bound
 
         node = WindowNode(
             name=window_name,

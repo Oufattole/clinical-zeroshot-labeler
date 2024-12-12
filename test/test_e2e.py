@@ -88,22 +88,24 @@ class DummyModel:
         """Return next token for each sequence."""
         tokens = []
         times = []
+        numeric_values = []
         for i, seq in enumerate(self.sequences):
             if self.current_positions[i] < len(seq):
                 tokens.append(seq[self.current_positions[i]][0])
                 times.append(seq[self.current_positions[i]][1])
+                numeric_values.append(seq[self.current_positions[i]][2])
             else:
                 raise ValueError("Sequence is exhausted, zero_shot_labeler should have stopped generation.")
             self.current_positions[i] += 1
         next_codes = torch.tensor(tokens, device=prompts.device)
         next_times = torch.tensor(times, device=prompts.device) / 24
-        next_numeric_values = torch.zeros_like(next_codes)
+        next_numeric_values = torch.tensor(numeric_values)
         logger.warning(f"times: {next_times}")
         return next_codes, next_times, next_numeric_values
 
 
 @pytest.fixture
-def task_config_yaml():
+def icu_morality_task_config_yaml():
     return """
     predicates:
       hospital_discharge:
@@ -144,6 +146,45 @@ def task_config_yaml():
 
 
 @pytest.fixture
+def abnormal_lab_task_config_yaml():
+    return """
+    predicates:
+        hospital_admission:
+            code: {regex: "HOSPITAL_ADMISSION//.*"}
+        lab:
+            code: {regex: "LAB//.*"}
+        high_lab:
+            code: {regex: "HOSPITAL_ADMISSION//.*"}
+            value_min: 2.0
+            value_min_inclusive: True
+        low_lab:
+            code: {regex: "HOSPITAL_ADMISSION//.*"}
+            value_max: -2.0
+            value_max_inclusive: False
+        abnormal_lab:
+            expr: or(high_lab, low_lab)
+
+    trigger: hospital_admission
+
+    windows:
+        input:
+            start: NULL
+            end: trigger
+            start_inclusive: True
+            end_inclusive: True
+            index_timestamp: end
+        target:
+            start: input.end
+            end: start + 4d
+            start_inclusive: False
+            end_inclusive: True
+            has:
+                lab: (1, None)
+            label: abnormal_lab
+    """
+
+
+@pytest.fixture
 def metadata_df():
     return pl.DataFrame(
         {
@@ -154,6 +195,8 @@ def metadata_df():
                 "HOSPITAL_DISCHARGE//MEDICAL",
                 "MEDS_DEATH",
                 "OTHER_EVENT",
+                "LAB//1",
+                "LAB//2",
             ]
         }
     ).with_row_index("code/vocab_index")
@@ -231,11 +274,11 @@ def test_window_tree():
 def successful_death_sequence():
     return {
         "sequence": [
-            (5, 0.0),  # Other event at index
-            (5, 20.0),  # Other event during input
-            (5, 40.0),  # Other event during gap
-            (4, 72.0),  # Death after gap
-            (5, 73.0),  # Other event after death
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (4, 72.0, 0.0),  # Death after gap
+            (5, 73.0, 0.0),  # Other event after death
         ],
         "expected_statuses": [
             torch.tensor([0]),  # Initial state
@@ -251,11 +294,11 @@ def successful_death_sequence():
 def successful_discharge_sequence():
     return {
         "sequence": [
-            (5, 0.0),  # Other event at index
-            (5, 20.0),  # Other event during input
-            (5, 40.0),  # Other event during gap
-            (3, 72.0),  # Hospital discharge after gap
-            (5, 73.0),  # Other event after discharge
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (3, 72.0, 0.0),  # Hospital discharge after gap
+            (5, 73.0, 0.0),  # Other event after discharge
         ],
         "expected_statuses": [
             torch.tensor([0]),  # Initial state
@@ -271,11 +314,11 @@ def successful_discharge_sequence():
 def impossible_readmission_sequence():
     return {
         "sequence": [
-            (5, 0.0),  # Other event at index
-            (5, 12.0),  # Other event
-            (1, 24.0),  # ICU readmission during gap
-            (4, 72.0),  # Death (but already failed)
-            (5, 73.0),  # Other event after death
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 12.0, 0.0),  # Other event
+            (1, 24.0, 0.0),  # ICU readmission during gap
+            (4, 72.0, 0.0),  # Death (but already failed)
+            (5, 73.0, 0.0),  # Other event after death
         ],
         "expected_statuses": [
             torch.tensor([0]),  # Initial state
@@ -291,11 +334,11 @@ def impossible_readmission_sequence():
 def undetermined_sequence():
     return {
         "sequence": [
-            (5, 0.0),  # Other event at index
-            (5, 24.0),  # Other event at input boundary
-            (5, 48.0),  # Other event at gap boundary
-            (5, 72.0),  # Other event (no outcome)
-            (5, 73.0),  # Other event (no outcome)
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 24.0, 0.0),  # Other event at input boundary
+            (5, 48.0, 0.0),  # Other event at gap boundary
+            (5, 72.0, 0.0),  # Other event (no outcome)
+            (5, 73.0, 0.0),  # Other event (no outcome)
         ],
         "expected_statuses": [
             torch.tensor([0]),  # Initial state
@@ -316,7 +359,7 @@ def undetermined_sequence():
         "undetermined_sequence",
     ],
 )
-def test_icu_mortality_sequences(task_config_yaml, metadata_df, sequence_fixture_name, request):
+def test_icu_mortality_sequences(icu_morality_task_config_yaml, metadata_df, sequence_fixture_name, request):
     """Test ICU mortality task with different sequence patterns."""
     # Get sequence data from fixture
     sequence_data = request.getfixturevalue(sequence_fixture_name)
@@ -325,7 +368,7 @@ def test_icu_mortality_sequences(task_config_yaml, metadata_df, sequence_fixture
 
     # Create config from YAML
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
-        f.write(task_config_yaml)
+        f.write(icu_morality_task_config_yaml)
         f.flush()
         task_config = TaskExtractorConfig.load(f.name)
 
@@ -339,6 +382,66 @@ def test_icu_mortality_sequences(task_config_yaml, metadata_df, sequence_fixture
 
     # Test each step
     for step, expected_status in enumerate(expected_statuses):
+        next_tokens, next_times, _ = model.generate_next_token(prompts)
+        status = tree.update(tokens=next_tokens, time_deltas=next_times + gap_days)
+
+        assert torch.equal(
+            status, expected_status
+        ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
+
+        prompts = torch.cat([prompts, next_tokens.unsqueeze(1)], dim=1)
+
+
+@pytest.fixture
+def successful_abnormal_lab():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (6, 72.0, 0.0),  # Lab event
+            (7, 73.0, 0.0),  # Other lab event
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Other event
+            torch.tensor([2]),  # Satisfied (death)
+            torch.tensor([2]),  # Remains satisfied
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "sequence_fixture_name",
+    [
+        "successful_abnormal_lab",
+    ],
+)
+def test_abnormal_lab_sequences(abnormal_lab_task_config_yaml, metadata_df, sequence_fixture_name, request):
+    """Test ICU mortality task with different sequence patterns."""
+    # Get sequence data from fixture
+    sequence_data = request.getfixturevalue(sequence_fixture_name)
+    sequence = sequence_data["sequence"]
+    expected_statuses = sequence_data["expected_statuses"]
+
+    # Create config from YAML
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
+        f.write(abnormal_lab_task_config_yaml)
+        f.flush()
+        task_config = TaskExtractorConfig.load(f.name)
+
+    # Setup model and tracker
+    model = DummyModel([sequence])
+    batch_size = 1
+    prompts = torch.zeros((batch_size, 1), dtype=torch.long)
+    tree = convert_task_config(task_config, batch_size=batch_size, metadata_df=metadata_df)
+    gap_days, prior_windows, index_window = calculate_index_timestamp_info(tree)
+    tree.root.ignore_windows(prior_windows + ["trigger"])
+
+    # Test each step
+    for step, expected_status in enumerate(expected_statuses):
+        logger.info(f"Step {step}: Expected status {expected_status}")
         next_tokens, next_times, _ = model.generate_next_token(prompts)
         status = tree.update(tokens=next_tokens, time_deltas=next_times + gap_days)
 
