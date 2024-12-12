@@ -251,7 +251,11 @@ def test_window_tree():
     print_window_tree_with_state(tracker.root)
 
     logger.info("\n=== Test Step 1: Admission events ===")
-    status = tracker.update(tokens=torch.tensor([1, 1]), time_deltas=torch.tensor([0.0, 0.0]))
+    status = tracker.update(
+        tokens=torch.tensor([1, 1]),
+        time_deltas=torch.tensor([0.0, 0.0]),
+        numeric_values=torch.tensor([0.0, 0.0]),
+    )
     logger.info(f"Expecting: Both sequences start, trigger satisfied. Status is: {status}")
     print_window_tree_with_state(tracker.root)
     assert (status == torch.ones_like(status)).all()
@@ -260,12 +264,17 @@ def test_window_tree():
     status = tracker.update(
         tokens=torch.tensor([2, 4]),  # Lab test for seq 1, other event for seq 2
         time_deltas=torch.tensor([0.2, 0.2]),
+        numeric_values=torch.tensor([0.0, 0.0]),
     )
     logger.info(f"Expecting: Seq 1 progresses, Seq 2 stalls. Status is: {status}")
     assert (status == torch.ones_like(status)).all(), status
 
     logger.info("\n=== Test Step 3: Death vs other event ===")
-    status = tracker.update(tokens=torch.tensor([3, 4]), time_deltas=torch.tensor([1.5, 1.5]))
+    status = tracker.update(
+        tokens=torch.tensor([3, 4]),
+        time_deltas=torch.tensor([1.5, 1.5]),
+        numeric_values=torch.tensor([0.0, 0.0]),
+    )
     logger.info(f"Expecting: Seq 1 completes successfully, Seq 2 fails. Status is: {status}")
     assert (status == torch.tensor([2, 3])).all(), status
 
@@ -287,6 +296,7 @@ def successful_death_sequence():
             torch.tensor([2]),  # Satisfied (death)
             torch.tensor([2]),  # Remains satisfied
         ],
+        "label": True,
     }
 
 
@@ -307,6 +317,7 @@ def successful_discharge_sequence():
             torch.tensor([2]),  # Satisfied (discharge)
             torch.tensor([2]),  # Remains satisfied
         ],
+        "label": False,
     }
 
 
@@ -327,6 +338,7 @@ def impossible_readmission_sequence():
             torch.tensor([3]),  # Remains impossible
             torch.tensor([3]),  # Remains impossible
         ],
+        "label": False,
     }
 
 
@@ -347,6 +359,7 @@ def undetermined_sequence():
             torch.tensor([1]),  # Still active (no outcome)
             torch.tensor([1]),  # Still active (no outcome)
         ],
+        "label": False,
     }
 
 
@@ -382,14 +395,17 @@ def test_icu_mortality_sequences(icu_morality_task_config_yaml, metadata_df, seq
 
     # Test each step
     for step, expected_status in enumerate(expected_statuses):
-        next_tokens, next_times, _ = model.generate_next_token(prompts)
-        status = tree.update(tokens=next_tokens, time_deltas=next_times + gap_days)
+        next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
+        status = tree.update(
+            tokens=next_tokens, time_deltas=next_times + gap_days, numeric_values=numeric_values
+        )
 
         assert torch.equal(
             status, expected_status
         ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
 
         prompts = torch.cat([prompts, next_tokens.unsqueeze(1)], dim=1)
+    assert sequence_data["label"] == any(tree.root.get_labels())
 
 
 @pytest.fixture
@@ -442,14 +458,17 @@ def test_abnormal_lab_sequences(abnormal_lab_task_config_yaml, metadata_df, sequ
     # Test each step
     for step, expected_status in enumerate(expected_statuses):
         logger.info(f"Step {step}: Expected status {expected_status}")
-        next_tokens, next_times, _ = model.generate_next_token(prompts)
-        status = tree.update(tokens=next_tokens, time_deltas=next_times + gap_days)
+        next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
+        status = tree.update(
+            tokens=next_tokens, time_deltas=next_times + gap_days, numeric_values=numeric_values
+        )
 
         assert torch.equal(
             status, expected_status
         ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
 
         prompts = torch.cat([prompts, next_tokens.unsqueeze(1)], dim=1)
+    assert sequence_data["label"] == any(tree.root.get_labels())
 
 
 def test_time_edge_cases():

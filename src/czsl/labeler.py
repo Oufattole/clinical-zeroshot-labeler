@@ -108,6 +108,14 @@ class WindowNode:
     children: list["WindowNode"] = field(default_factory=list)
     batch_states: list[WindowState] = field(default_factory=list)
     ignore: bool = False
+    label_value: bool | None = None
+
+    def get_labels(self):
+        labels = []
+        labels.append(self.label_value)
+        for node in self.children:
+            labels.extend(node.get_labels())
+        return labels
 
     def ignore_windows(self, window_names: list[str]):
         if self.name in window_names:
@@ -123,6 +131,11 @@ class WindowNode:
         # Also initialize children
         for child in self.children:
             child.initialize_batch(batch_size)
+
+    def _check_label(self, state: WindowState) -> bool:
+        if self.label is not None:
+            if self._get_count(self.label, state) > 0:
+                self.label_value = True
 
     def _check_start_condition(self, time_delta: float, event_token: int, batch_idx: int) -> bool:
         """Check if window should start at current time/event."""
@@ -172,9 +185,11 @@ class WindowNode:
             else:  # previous
                 raise NotImplementedError("Previous event bounds not yet supported")
 
-    def _update_counts(self, state: WindowState, event_token: int):
+    def _update_counts(self, state: WindowState, event_token: int, numeric_value: float):
         """Update predicate counts for the window."""
         token_str = str(event_token)
+        # TODO: also check label predicate, seems the tensorization of that predicate is incorrect
+
         if token_str not in state.predicate_counts:
             state.predicate_counts[token_str] = 0
         state.predicate_counts[token_str] += 1
@@ -228,7 +243,12 @@ class WindowNode:
         return False
 
     def update(
-        self, batch_idx: int, time_delta: float, event_token: int, parent_state: WindowState | None = None
+        self,
+        batch_idx: int,
+        time_delta: float,
+        event_token: int,
+        numeric_values: float,
+        parent_state: WindowState | None = None,
     ) -> WindowStatus:
         """Update state for specific batch element."""
         if self.ignore:
@@ -254,9 +274,11 @@ class WindowNode:
 
         # Update counts if in window
         if state.in_window:
-            self._update_counts(state, event_token)
+            self._update_counts(state, event_token, numeric_values)
             state.status = WindowStatus.ACTIVE
             logger.info(f"  updated counts: {state.predicate_counts}")
+
+            self._check_label(state)
 
             # Check if constraints satisfied
             if self._check_constraints_satisfied(state):
@@ -300,7 +322,10 @@ class AutoregressiveWindowTree:
         self.root.initialize_batch(batch_size)
 
     def update(
-        self, tokens: torch.Tensor, time_deltas: torch.Tensor  # [batch_size]  # [batch_size]
+        self,
+        tokens: torch.Tensor,
+        time_deltas: torch.Tensor,
+        numeric_values: torch.Tensor,
     ) -> torch.Tensor:  # [batch_size] of ConstraintStatus
         """Process new tokens through tree."""
 
@@ -309,7 +334,11 @@ class AutoregressiveWindowTree:
         ) -> WindowStatus:
             # Update this node's state
             status = node.update(
-                batch_idx, time_deltas[batch_idx].item(), tokens[batch_idx].item(), parent_state
+                batch_idx,
+                time_deltas[batch_idx].item(),
+                tokens[batch_idx].item(),
+                numeric_values,
+                parent_state,
             )
 
             # If this node is satisfied, process children
