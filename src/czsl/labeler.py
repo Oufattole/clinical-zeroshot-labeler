@@ -22,19 +22,56 @@ def get_predicate_tensor(metadata_df: pl.DataFrame, config: TaskExtractorConfig,
     predicate = config.predicates[predicate_name]
     if isinstance(predicate, PlainPredicateConfig):
         predicate_tensor = metadata_df.filter(predicate.MEDS_eval_expr())["code/vocab_index"].to_torch()
+        predicate_value_limits = {
+            str(each.item()): (predicate.value_min, predicate.value_max) for each in predicate_tensor
+        }
+        predicate_value_limit_inclusion = {
+            str(each.item()): (predicate.value_min_inclusive, predicate.value_max_inclusive)
+            for each in predicate_tensor
+        }
     elif isinstance(predicate, DerivedPredicateConfig):
         if predicate.is_and:
             raise NotImplementedError("AND predicates not yet supported")
         predicates = predicate.input_predicates
-        predicate_tensor = torch.concat(
-            [
-                metadata_df.filter(config.plain_predicates[p].MEDS_eval_expr())["code/vocab_index"].to_torch()
-                for p in predicates
-            ]
-        )
+        predicate_value_limits = {}
+        predicate_value_limit_inclusion = {}
+        p_tensors_list = []
+        for p in predicates:
+            p_tensors = metadata_df.filter(config.plain_predicates[p].MEDS_eval_expr())["code/vocab_index"]
+            p_tensors_list.append(p_tensors.to_torch())
+            predicate_value_limits.update(
+                {
+                    str(each): (
+                        config.plain_predicates[p].value_min
+                        if predicate_value_limits.get(str(each), (None, None))[0] is None
+                        else predicate_value_limits[str(each)][0],
+                        config.plain_predicates[p].value_max
+                        if predicate_value_limits.get(str(each), (None, None))[1] is None
+                        else predicate_value_limits[str(each)][1],
+                    )
+                    for each in p_tensors
+                }
+            )
+
+            predicate_value_limit_inclusion.update(
+                {
+                    str(each): (
+                        config.plain_predicates[p].value_min_inclusive
+                        if predicate_value_limit_inclusion.get(str(each), (None, None))[0] is None
+                        else predicate_value_limit_inclusion[str(each)][0],
+                        config.plain_predicates[p].value_max_inclusive
+                        if predicate_value_limit_inclusion.get(str(each), (None, None))[1] is None
+                        else predicate_value_limit_inclusion[str(each)][1],
+                    )
+                    for each in p_tensors
+                }
+            )
+        predicate_tensor = torch.concat(p_tensors_list)
     else:
         raise ValueError(f"Unknown predicate type {type(predicate)}")
-    return predicate_tensor
+    if predicate_tensor.shape[0] == 0:
+        logger.warning(f"Predicate {predicate_name} returned no rows. Skipping it.")
+    return predicate_tensor, predicate_value_limits, predicate_value_limit_inclusion
 
 
 class WindowStatus(Enum):
@@ -93,6 +130,9 @@ class WindowState:
         self.status = WindowStatus.UNDETERMINED
 
 
+T = None | int
+
+
 @dataclass
 class WindowNode:
     """Node in autoregressive window tree."""
@@ -104,6 +144,8 @@ class WindowNode:
     label: str | None
     index_timestamp: str | None
     tensorized_predicates: dict[str, torch.Tensor]
+    predicate_value_limits: dict[str, tuple[(int | None), (int | None)]]
+    predicate_value_limit_inclusion: dict[str, tuple[(bool | None), (bool | None)]]
     parent: Optional["WindowNode"] = None
     children: list["WindowNode"] = field(default_factory=list)
     batch_states: list[WindowState] = field(default_factory=list)
@@ -188,11 +230,30 @@ class WindowNode:
     def _update_counts(self, state: WindowState, event_token: int, numeric_value: float):
         """Update predicate counts for the window."""
         token_str = str(event_token)
-        # TODO: also check label predicate, seems the tensorization of that predicate is incorrect
 
         if token_str not in state.predicate_counts:
             state.predicate_counts[token_str] = 0
-        state.predicate_counts[token_str] += 1
+
+        logger.warning(f"numeric_value limit is set for all vocab_indices {token_str} in window {self.name}")
+
+        if token_str in self.predicate_value_limits:
+            min_value, max_value = self.predicate_value_limits[token_str]
+            if min_value is not None or max_value is not None:
+                min_inclusive, max_inclusive = self.predicate_value_limit_inclusion[token_str]
+                if min_value is not None and (
+                    numeric_value > min_value or (min_inclusive and numeric_value == min_value)
+                ):
+                    # high numeric value check
+                    state.predicate_counts[token_str] += 1
+                if max_value is not None and (
+                    numeric_value < max_value or (max_inclusive and numeric_value == max_value)
+                ):
+                    # low numeric value check
+                    state.predicate_counts[token_str] += 1
+            else:
+                state.predicate_counts[token_str] += 1
+        else:
+            state.predicate_counts[token_str] += 1
 
     def _get_count(self, predicate_id: str, state: WindowState) -> int:
         predicate_tensor = self.tensorized_predicates[predicate_id]
@@ -280,18 +341,18 @@ class WindowNode:
 
             self._check_label(state)
 
-            # Check if constraints satisfied
-            if self._check_constraints_satisfied(state):
-                state.status = WindowStatus.SATISFIED
-                state.in_window = False  # Close window once satisfied
-                logger.info("  constraints satisfied")
-                return state.status
-
             # Check if constraints now impossible
             if self._check_constraints_impossible(state):
                 state.status = WindowStatus.IMPOSSIBLE
                 state.in_window = False
                 logger.info("  constraints impossible")
+                return state.status
+
+            # Check if constraints satisfied
+            if self._check_constraints_satisfied(state) or self.label_value:
+                state.status = WindowStatus.SATISFIED
+                state.in_window = False  # Close window once satisfied
+                logger.info("  constraints satisfied")
                 return state.status
 
         # Check window end
@@ -450,7 +511,14 @@ def convert_task_config(
         AutoregressiveWindowTree configured according to task config
     """
     # 0. Precache tensorized predicates
-    tensorized_predicates = {p: get_predicate_tensor(metadata_df, config, p) for p in config.predicates}
+    tensorized_predicates, predicate_value_limits, predicate_value_limit_inclusion = {}, {}, {}
+    for p in config.predicates:
+        pred_tensor, pred_value_limit, pred_value_limit_inclusion = get_predicate_tensor(
+            metadata_df, config, p
+        )
+        tensorized_predicates[p] = pred_tensor
+        predicate_value_limits.update(pred_value_limit)
+        predicate_value_limit_inclusion.update(pred_value_limit_inclusion)
 
     # 1. Create trigger/root node
     root = WindowNode(
@@ -461,6 +529,8 @@ def convert_task_config(
         label=None,
         index_timestamp=None,
         tensorized_predicates=tensorized_predicates,
+        predicate_value_limits=predicate_value_limits,
+        predicate_value_limit_inclusion=predicate_value_limit_inclusion,
     )
 
     def convert_endpoint_expr(
@@ -482,7 +552,7 @@ def convert_task_config(
             direction = "previous" if expr.end_event.startswith("-") else "next"
             predicate = expr.end_event.lstrip("-")
             if predicate not in [END_OF_RECORD_KEY, START_OF_RECORD_KEY]:
-                predicate = get_predicate_tensor(metadata_df, config, predicate)
+                predicate, _, _ = get_predicate_tensor(metadata_df, config, predicate)
 
             return (
                 EventBound(
@@ -522,7 +592,6 @@ def convert_task_config(
                     end_bound = all_nodes[parent_window_name].start_bound
                 elif start_or_end == "end":
                     end_bound = all_nodes[parent_window_name].end_bound
-
         node = WindowNode(
             name=window_name,
             start_bound=start_bound,
@@ -531,6 +600,8 @@ def convert_task_config(
             label=window.label,
             index_timestamp=window.index_timestamp,
             tensorized_predicates=tensorized_predicates,
+            predicate_value_limits=predicate_value_limits,
+            predicate_value_limit_inclusion=predicate_value_limit_inclusion,
         )
         all_nodes[window_name] = node
 

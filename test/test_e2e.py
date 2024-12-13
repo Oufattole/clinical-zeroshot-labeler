@@ -149,22 +149,22 @@ def icu_morality_task_config_yaml():
 def abnormal_lab_task_config_yaml():
     return """
     predicates:
-        hospital_admission:
-            code: {regex: "HOSPITAL_ADMISSION//.*"}
+        hospital_discharge:
+            code: {regex: "HOSPITAL_DISCHARGE//.*"}
         lab:
             code: {regex: "LAB//.*"}
         high_lab:
-            code: {regex: "HOSPITAL_ADMISSION//.*"}
+            code: {regex: "LAB//.*"}
             value_min: 2.0
             value_min_inclusive: True
         low_lab:
-            code: {regex: "HOSPITAL_ADMISSION//.*"}
+            code: {regex: "LAB//.*"}
             value_max: -2.0
             value_max_inclusive: False
         abnormal_lab:
             expr: or(high_lab, low_lab)
 
-    trigger: hospital_admission
+    trigger: hospital_discharge
 
     windows:
         input:
@@ -218,6 +218,8 @@ def test_window_tree():
         index_timestamp=None,
         label=None,
         tensorized_predicates=tensorized_predicates,
+        predicate_value_limits={},
+        predicate_value_limit_inclusion={},
     )
 
     obs_window = WindowNode(
@@ -229,6 +231,8 @@ def test_window_tree():
         index_timestamp=None,
         label=None,
         tensorized_predicates=tensorized_predicates,
+        predicate_value_limits={},
+        predicate_value_limit_inclusion={},
     )
     root.children.append(obs_window)
 
@@ -243,6 +247,8 @@ def test_window_tree():
         index_timestamp=None,
         label=None,
         tensorized_predicates=tensorized_predicates,
+        predicate_value_limits={},
+        predicate_value_limit_inclusion={},
     )
     obs_window.children.append(outcome_window)
 
@@ -415,16 +421,38 @@ def successful_abnormal_lab():
             (5, 0.0, 0.0),  # Other event at index
             (5, 20.0, 0.0),  # Other event during input
             (5, 40.0, 0.0),  # Other event during gap
-            (6, 72.0, 0.0),  # Lab event
-            (7, 73.0, 0.0),  # Other lab event
+            (6, 72.0, 100.0),  # Lab event
+            (7, 73.0, 100.0),  # Other lab event
         ],
         "expected_statuses": [
             torch.tensor([1]),  # Initial state
             torch.tensor([1]),  # Input window active
             torch.tensor([1]),  # Other event
-            torch.tensor([2]),  # Satisfied (death)
+            torch.tensor([2]),  # Satisfied
             torch.tensor([2]),  # Remains satisfied
         ],
+        "label": True,
+    }
+
+
+@pytest.fixture
+def successful_second_abnormal_lab():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (6, 72.0, 0.0),  # Normal Lab event
+            (7, 73.0, 100.0),  # Abnormal lab event
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Other event
+            torch.tensor([1]),  # Active
+            torch.tensor([2]),  # Remains satisfied
+        ],
+        "label": True,
     }
 
 
@@ -432,6 +460,7 @@ def successful_abnormal_lab():
     "sequence_fixture_name",
     [
         "successful_abnormal_lab",
+        "successful_second_abnormal_lab",
     ],
 )
 def test_abnormal_lab_sequences(abnormal_lab_task_config_yaml, metadata_df, sequence_fixture_name, request):
