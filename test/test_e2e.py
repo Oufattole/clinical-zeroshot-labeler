@@ -3,9 +3,9 @@ import tempfile
 import polars as pl
 import pytest
 import torch
+from aces.config import TaskExtractorConfig
 from loguru import logger
 
-from czsl.config import TaskExtractorConfig
 from czsl.labeler import (
     AutoregressiveWindowTree,
     EventBound,

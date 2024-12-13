@@ -5,9 +5,7 @@ from typing import Literal, Optional
 
 import polars as pl
 import torch
-from loguru import logger
-
-from czsl.config import (
+from aces.config import (
     END_OF_RECORD_KEY,
     START_OF_RECORD_KEY,
     DerivedPredicateConfig,
@@ -16,6 +14,7 @@ from czsl.config import (
     TemporalWindowBounds,
     ToEventWindowBounds,
 )
+from loguru import logger
 
 
 def get_predicate_tensor(metadata_df: pl.DataFrame, config: TaskExtractorConfig, predicate_name: str):
