@@ -9,6 +9,7 @@ from loguru import logger
 from czsl.labeler import (
     AutoregressiveWindowTree,
     EventBound,
+    PredicateTensor,
     TemporalBound,
     WindowNode,
     calculate_index_timestamp_info,
@@ -204,51 +205,73 @@ def metadata_df():
 
 def test_window_tree():
     """Test the window tree implementation."""
-    # Create tree for in-hospital mortality prediction
+    # Create PredicateTensor objects for each event type
     tensorized_predicates = {
-        "Admission": torch.tensor([1]),
-        "Lab": torch.tensor([2]),
-        "Death": torch.tensor([3]),
+        "Admission": PredicateTensor(
+            name="Admission",
+            tokens=torch.tensor([1]),
+            value_limits=(None, None),
+            value_inclusions=(None, None),
+            children=[],
+            is_and=False,
+        ),
+        "Lab": PredicateTensor(
+            name="Lab",
+            tokens=torch.tensor([2]),
+            value_limits=(None, None),
+            value_inclusions=(None, None),
+            children=[],
+            is_and=False,
+        ),
+        "Death": PredicateTensor(
+            name="Death",
+            tokens=torch.tensor([3]),
+            value_limits=(None, None),
+            value_inclusions=(None, None),
+            children=[],
+            is_and=False,
+        ),
     }
+
+    # Create root node (trigger window)
     root = WindowNode(
         name="trigger",
         start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
         end_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
-        predicate_constraints={"Admission": (1, 1)},  # Admission token = 1
+        predicate_constraints={"Admission": (1, 1)},  # Must see exactly one admission
         index_timestamp=None,
         label=None,
         tensorized_predicates=tensorized_predicates,
-        predicate_value_limits={},
-        predicate_value_limit_inclusion={},
     )
 
+    # Create observation window
     obs_window = WindowNode(
         name="observation",
         start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
         end_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(hours=24)),
-        predicate_constraints={"Lab": (1, None)},  # Lab test token = 2
+        predicate_constraints={"Lab": (1, None)},  # At least one lab test
         parent=root,
         index_timestamp=None,
         label=None,
         tensorized_predicates=tensorized_predicates,
-        predicate_value_limits={},
-        predicate_value_limit_inclusion={},
     )
     root.children.append(obs_window)
 
+    # Create outcome window
     outcome_window = WindowNode(
         name="outcome",
         start_bound=TemporalBound(reference="observation.end", inclusive=True, offset=timedelta(0)),
         end_bound=EventBound(
-            reference="observation.end", inclusive=True, predicate="3", direction="next"  # Death token
+            reference="observation.end",
+            inclusive=True,
+            predicate=tensorized_predicates["Death"],  # Use Death predicate object
+            direction="next",
         ),
         predicate_constraints={},
         parent=obs_window,
         index_timestamp=None,
         label=None,
         tensorized_predicates=tensorized_predicates,
-        predicate_value_limits={},
-        predicate_value_limit_inclusion={},
     )
     obs_window.children.append(outcome_window)
 
@@ -277,7 +300,7 @@ def test_window_tree():
 
     logger.info("\n=== Test Step 3: Death vs other event ===")
     status = tracker.update(
-        tokens=torch.tensor([3, 4]),
+        tokens=torch.tensor([3, 4]),  # Death for seq 1, other event for seq 2
         time_deltas=torch.tensor([1.5, 1.5]),
         numeric_values=torch.tensor([0.0, 0.0]),
     )
@@ -398,13 +421,17 @@ def test_icu_mortality_sequences(icu_morality_task_config_yaml, metadata_df, seq
     tree = convert_task_config(task_config, batch_size=batch_size, metadata_df=metadata_df)
     gap_days, prior_windows, index_window = calculate_index_timestamp_info(tree)
     tree.root.ignore_windows(prior_windows + ["trigger"])
+    logger.info(print_window_tree_with_state(tree.root))
 
     # Test each step
     for step, expected_status in enumerate(expected_statuses):
         next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
-        status = tree.update(
-            tokens=next_tokens, time_deltas=next_times + gap_days, numeric_values=numeric_values
-        )
+        time_deltas = next_times + gap_days
+        status = tree.update(tokens=next_tokens, time_deltas=time_deltas, numeric_values=numeric_values)
+        logger.info("Added Event: " + str(next_tokens))
+        logger.info("TREE NAME: " + tree.root.children[0].children[0].children[0].name)
+        logger.info("Time: " + str(time_deltas))
+        print_window_tree_with_state(tree.root)
 
         assert torch.equal(
             status, expected_status
