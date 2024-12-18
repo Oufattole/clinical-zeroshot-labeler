@@ -750,8 +750,9 @@ class SimpleGenerativeModel:
         "multiple_sequences",
     ],
 )
+@pytest.mark.parametrize("time_scale", ["Y", "D"])
 def test_sequence_labeler_mortality(
-    icu_morality_task_config_yaml, metadata_df, sequence_fixture_name, request
+    icu_morality_task_config_yaml, metadata_df, sequence_fixture_name, request, time_scale
 ):
     """Test SequenceLabeler with various ICU mortality sequences."""
     # Get sequence data from fixture
@@ -760,8 +761,24 @@ def test_sequence_labeler_mortality(
     expected_statuses = sequence_data["expected_statuses"]
     batch_size = 1 if isinstance(sequence[0][0], int) else len(sequence[0][0])
 
-    # Create labeler
-    labeler = SequenceLabeler.from_yaml_str(icu_morality_task_config_yaml, metadata_df, batch_size=batch_size)
+    # Convert sequence times to the target scale
+    conversion_factor = (
+        1 / 365 / 24 if time_scale == "Y" else 1 / 24
+    )  # Convert hours to years for Y scale or days for D
+    if isinstance(sequence[0][0], int):
+        # Single sequence case
+        sequence = [(t, time * conversion_factor, v) for t, time, v in sequence]
+    else:
+        # Multiple sequence case (tuple of sequences)
+        sequence = [
+            (tuple(t), tuple(time * conversion_factor for time in times), tuple(v))
+            for t, times, v in sequence
+        ]
+
+    # Create labeler with time scale
+    labeler = SequenceLabeler.from_yaml_str(
+        icu_morality_task_config_yaml, metadata_df, batch_size=batch_size, time_scale=time_scale
+    )
 
     # Set up model
     model = SimpleGenerativeModel([sequence])
@@ -770,13 +787,12 @@ def test_sequence_labeler_mortality(
     # Process each step
     for step, expected_status in enumerate(expected_statuses):
         next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
-        # Convert times to days by dividing by 24 like in original test
-        next_times = next_times / 24.0
         status = labeler.process_step(next_tokens, next_times, numeric_values)
 
-        assert torch.equal(
-            status, expected_status
-        ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
+        assert torch.equal(status, expected_status), (
+            f"{sequence_fixture_name} ({time_scale}) - Step {step}: "
+            f"Expected status {expected_status}, got {status}"
+        )
 
         if not model.is_finished():
             prompts = next_tokens
@@ -791,7 +807,7 @@ def test_sequence_labeler_mortality(
 
     assert torch.equal(
         labels & (status == torch.tensor(2)), expected_labels
-    ), f"{sequence_fixture_name}: Expected labels {expected_labels}, got {labels}"
+    ), f"{sequence_fixture_name} ({time_scale}): Expected labels {expected_labels}, got {labels}"
 
 
 @pytest.mark.parametrize(
@@ -803,8 +819,9 @@ def test_sequence_labeler_mortality(
         "edge_case_lab_sequence",
     ],
 )
+@pytest.mark.parametrize("time_scale", ["Y", "D"])
 def test_sequence_labeler_lab_values(
-    abnormal_lab_task_config_yaml, metadata_df, sequence_fixture_name, request
+    abnormal_lab_task_config_yaml, metadata_df, sequence_fixture_name, request, time_scale
 ):
     """Test SequenceLabeler with various lab value sequences."""
     # Get sequence data from fixture
@@ -812,8 +829,16 @@ def test_sequence_labeler_lab_values(
     sequence = sequence_data["sequence"]
     expected_statuses = sequence_data["expected_statuses"]
 
-    # Create labeler
-    labeler = SequenceLabeler.from_yaml_str(abnormal_lab_task_config_yaml, metadata_df, batch_size=1)
+    # Convert sequence times to the target scale
+    conversion_factor = (
+        1 / 365 / 24 if time_scale == "Y" else 1 / 24
+    )  # Convert hours to years for Y scale or days for D
+    sequence = [(t, time * conversion_factor, v) for t, time, v in sequence]
+
+    # Create labeler with time scale
+    labeler = SequenceLabeler.from_yaml_str(
+        abnormal_lab_task_config_yaml, metadata_df, batch_size=1, time_scale=time_scale
+    )
 
     # Set up model
     model = SimpleGenerativeModel([sequence])
@@ -822,13 +847,12 @@ def test_sequence_labeler_lab_values(
     # Test each step
     for step, expected_status in enumerate(expected_statuses):
         next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
-        # Convert times to days
-        next_times = next_times / 24.0
         status = labeler.process_step(next_tokens, next_times, numeric_values)
 
-        assert torch.equal(
-            status, expected_status
-        ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
+        assert torch.equal(status, expected_status), (
+            f"{sequence_fixture_name} ({time_scale}) - Step {step}: "
+            f"Expected status {expected_status}, got {status}"
+        )
 
         if not model.is_finished():
             prompts = torch.cat([prompts, next_tokens.unsqueeze(1)], dim=1)
@@ -837,4 +861,4 @@ def test_sequence_labeler_lab_values(
     labels = labeler.get_labels()
     assert sequence_data["label"] == any(
         labels
-    ), f"{sequence_fixture_name}: Expected label {sequence_data['label']}, got {labels}"
+    ), f"{sequence_fixture_name} ({time_scale}): Expected label {sequence_data['label']}, got {labels}"

@@ -910,47 +910,62 @@ def convert_task_config(
     return tree
 
 
+TimeScale = Literal["Y", "M", "W", "D", "h", "m", "s"]
+
+
 @dataclass
 class SequenceLabeler:
-    """
-    Simple API for labeling sequences using clinical zero-shot labeling.
-
-    Example usage:
-        # Create labeler with your task config
-        labeler = SequenceLabeler.from_yaml_str(task_config_yaml, metadata_df)
-
-        # Process tokens
-        while not labeler.is_finished():
-            tokens, times, values = model.generate_next_token(prompts)
-            statuses = labeler.process_step(tokens, times, values)
-
-        # Get final labels
-        labels = labeler.get_labels()
-    """
-
     tree: AutoregressiveWindowTree
     gap_days: float
     batch_size: int
+    time_scale: TimeScale = "D"  # Default to days
     _finished: bool = False
 
+    def _convert_to_days(self, times: torch.Tensor) -> torch.Tensor:
+        """Convert times from the specified time scale to days."""
+        if self.time_scale == "Y":
+            return times * 365  # Approximate
+        elif self.time_scale == "M":
+            return times * 30  # Approximate
+        elif self.time_scale == "W":
+            return times * 7
+        elif self.time_scale == "D":
+            return times
+        elif self.time_scale == "h":
+            return times / 24
+        elif self.time_scale == "m":
+            return times / (24 * 60)
+        elif self.time_scale == "s":
+            return times / (24 * 60 * 60)
+        else:
+            raise ValueError(f"Unknown time scale: {self.time_scale}")
+
     @classmethod
-    def from_yaml_str(cls, yaml_str: str, metadata_df: pl.DataFrame, batch_size: int) -> "SequenceLabeler":
+    def from_yaml_str(
+        cls, yaml_str: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+    ) -> "SequenceLabeler":
         """Create a labeler from YAML task configuration string."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
             f.write(yaml_str)
             f.flush()
             task_config = TaskExtractorConfig.load(f.name)
-        return cls.from_task_config(task_config, metadata_df, batch_size)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
 
     @classmethod
-    def from_yaml_file(cls, yaml_path: str, metadata_df: pl.DataFrame, batch_size: int) -> "SequenceLabeler":
+    def from_yaml_file(
+        cls, yaml_path: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+    ) -> "SequenceLabeler":
         """Create a labeler from YAML task configuration file."""
         task_config = TaskExtractorConfig.load(yaml_path)
-        return cls.from_task_config(task_config, metadata_df, batch_size)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
 
     @classmethod
     def from_task_config(
-        cls, config: TaskExtractorConfig, metadata_df: pl.DataFrame, batch_size: int
+        cls,
+        config: TaskExtractorConfig,
+        metadata_df: pl.DataFrame,
+        batch_size: int,
+        time_scale: TimeScale = "D",
     ) -> "SequenceLabeler":
         """Create a labeler from TaskExtractorConfig object."""
         tree = convert_task_config(config, batch_size, metadata_df)
@@ -960,7 +975,7 @@ class SequenceLabeler:
         tree.root.initialize_batch(batch_size)
         tree.root.ignore_windows(prior_windows + ["trigger"])
 
-        return cls(tree=tree, gap_days=gap_days, batch_size=batch_size)
+        return cls(tree=tree, gap_days=gap_days, batch_size=batch_size, time_scale=time_scale)
 
     def process_step(
         self,
@@ -973,7 +988,7 @@ class SequenceLabeler:
 
         Args:
             tokens: Token IDs for current step [batch_size]
-            times: Time values for current step [batch_size]
+            times: Time values for current step [batch_size] in specified time_scale units
             values: Numeric values for current step [batch_size]
 
         Returns:
@@ -992,8 +1007,9 @@ class SequenceLabeler:
         times = times.view(self.batch_size)
         values = values.view(self.batch_size)
 
-        # Adjust times by gap days
-        time_deltas = times + self.gap_days
+        # Convert times to days and adjust by gap days
+        times_in_days = self._convert_to_days(times)
+        time_deltas = times_in_days + self.gap_days
 
         # Update tree state
         status = self.tree.update(tokens, time_deltas, values)
