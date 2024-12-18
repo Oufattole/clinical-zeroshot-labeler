@@ -9,7 +9,7 @@ meds_torch = ["**/*.yaml"]
 "*" = ["*.pyc"]
 
 [project]
-name = "czsl"
+name = "clinical_zeroshot_labeler"
 dynamic = ["version"]
 authors = [
   {name="Matthew McDermott", email="mattmcdermott8@gmail.com"},
