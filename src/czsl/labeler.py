@@ -49,21 +49,33 @@ class TemporalBound(WindowBound):
 class WindowState:
     """State of a window for one sequence in batch."""
 
-    start_time: float | None = None
-    end_time: float | None = None
-    in_window: bool = False
-    predicate_counts: dict[str, int] = field(default_factory=dict)
-    status: WindowStatus = WindowStatus.UNDETERMINED
-    waiting_for_next_time: float | None = None  # Used for end_inclusive event bounds, points to current time
+    batch_size: int
+    start_time: torch.Tensor = field(init=False)  # [batch_size] float tensor, initialized to torch.nan
+    end_time: torch.Tensor = field(init=False)  # [batch_size] float tensor, initialized to torch.nan
+    in_window: torch.Tensor = field(init=False)  # [batch_size] bool tensor
+    predicate_counts: dict[str, torch.Tensor] = field(default_factory=dict)  # str -> [batch_size] int tensor
+    status: torch.Tensor = field(init=False)  # [batch_size] int tensor of WindowStatus values
+    waiting_for_next_time: torch.Tensor = field(
+        init=False
+    )  # [batch_size] float tensor, initialized to torch.nan
+
+    def __post_init__(self):
+        """Initialize tensors with proper shapes and default values."""
+        self.start_time = torch.full((self.batch_size,), float("nan"))
+        self.end_time = torch.full((self.batch_size,), float("nan"))
+        self.in_window = torch.zeros(self.batch_size, dtype=torch.bool)
+        self.status = torch.full((self.batch_size,), WindowStatus.UNDETERMINED.value, dtype=torch.long)
+        self.waiting_for_next_time = torch.full((self.batch_size,), float("nan"))
 
     def reset(self):
         """Reset state for new sequence."""
-        self.start_time = None
-        self.end_time = None
-        self.in_window = False
-        self.predicate_counts.clear()
-        self.status = WindowStatus.UNDETERMINED
-        self.waiting_for_next_time = None
+        self.start_time.fill_(float("nan"))
+        self.end_time.fill_(float("nan"))
+        self.in_window.fill_(False)
+        for counts in self.predicate_counts.values():
+            counts.fill_(0)
+        self.status.fill_(WindowStatus.UNDETERMINED.value)
+        self.waiting_for_next_time.fill_(float("nan"))
 
 
 T = None | int
@@ -431,7 +443,7 @@ class WindowNode:
     tensorized_predicates: dict[str, PredicateTensor]
     parent: Optional["WindowNode"] = None
     children: list["WindowNode"] = field(default_factory=list)
-    batch_states: list[WindowState] = field(default_factory=list)
+    state: WindowState | None = None
     ignore: bool = False
     label_value: bool | None = None
 
@@ -445,189 +457,227 @@ class WindowNode:
     def ignore_windows(self, window_names: list[str]):
         if self.name in window_names:
             self.ignore = True
-            for each in self.batch_states:
-                each.status = WindowStatus.SATISFIED
+            self.state.status.fill_(WindowStatus.SATISFIED.value)
         for child in self.children:
             child.ignore_windows(window_names)
 
     def initialize_batch(self, batch_size: int):
         """Initialize batch states."""
-        self.batch_states = [WindowState() for _ in range(batch_size)]
-        # Also initialize children
+        self.state = WindowState(batch_size=batch_size)
         for child in self.children:
             child.initialize_batch(batch_size)
 
-    def _check_label(self, state: WindowState) -> bool:
+    def _check_label(self) -> None:
         if self.label is not None:
-            if self._get_count(self.label, state) > 0:
-                self.label_value = True
+            label_counts = self._get_count(self.label)
+            self.label_value = bool(torch.any(label_counts > 0).item())
 
-    def _check_start_condition(self, time_delta: float, event_token: int, batch_idx: int) -> bool:
+    def _check_start_condition(self, time_delta: torch.Tensor, event_token: torch.Tensor) -> torch.Tensor:
         """Check if window should start at current time/event."""
-        # Parse reference point
-        ref_time = 0.0  # Default to trigger time
-
-        # Check based on bound type
         if self.start_bound.bound_type == BoundType.TEMPORAL:
-            offset_days = self.start_bound.offset.total_seconds() / (24 * 3600)  # Convert to days
+            ref_time = torch.zeros_like(time_delta)  # Default to trigger time
+            offset_days = self.start_bound.offset.total_seconds() / (24 * 3600)
             target_time = ref_time + offset_days
 
             if self.start_bound.inclusive:
                 return time_delta >= target_time
             return time_delta > target_time
-
         else:  # EventBound
             if self.start_bound.direction == "next":
-                # Check if this is the target event
-                is_target = str(event_token) == self.start_bound.predicate
-                at_or_after_ref = time_delta >= ref_time
-                return is_target and at_or_after_ref
-            else:  # previous
-                # Not implemented - would need history
+                is_target = event_token == int(self.start_bound.predicate)
+                at_or_after_ref = time_delta >= 0
+                return is_target & at_or_after_ref
+            else:
                 raise NotImplementedError("Previous event bounds not yet supported")
 
-    def _check_end_condition(self, time_delta: float, event_token: int) -> bool:
+    def _check_end_condition(self, time_delta: torch.Tensor, event_token: torch.Tensor) -> torch.Tensor:
         """Check if window should end at current time/event."""
-        # Parse reference point - similar to start condition
-        ref_time = 0.0
-        if self.end_bound.reference != "trigger":
-            window_name, point = self.end_bound.reference.split(".")
-            # Would need to look up reference window state
-            # For simplicity, assume trigger reference for now
-
-        # Check based on bound type
         if self.end_bound.bound_type == BoundType.TEMPORAL:
+            ref_time = torch.zeros_like(time_delta)
             offset_days = self.end_bound.offset.total_seconds() / (24 * 3600)
             target_time = ref_time + offset_days
 
             if self.end_bound.inclusive:
                 return time_delta >= target_time
             return time_delta > target_time
-
         else:  # EventBound
-            if self.end_bound.direction == "next":
-                return str(event_token) == self.end_bound.predicate
-            else:  # previous
-                raise NotImplementedError("Previous event bounds not yet supported")
+            return False
 
-    def _update_counts(self, state: WindowState, event_token: int, numeric_value: float):
+    def _update_counts(self, event_token: torch.Tensor, numeric_value: torch.Tensor):
         """Update predicate counts for the window."""
+        for tensorized_predicate in self.tensorized_predicates.values():
+            tensorized_predicate.update_counts(self.state, event_token, numeric_value)
 
-        for _, tensorized_predicate in self.tensorized_predicates.items():
-            tensorized_predicate.update_counts(state, event_token, numeric_value)
-
-    def _get_count(self, predicate_id: str, state: WindowState) -> int:
+    def _get_count(self, predicate_id: str) -> torch.Tensor:
         predicate_tensor = self.tensorized_predicates[predicate_id]
-        return predicate_tensor.get_count(state)
+        # TODO: tensorize predicate_tensor
+        return torch.tensor(predicate_tensor.get_count(self.state))
 
-    def _check_constraints_satisfied(self, state: WindowState) -> bool:
+    def _check_constraints_satisfied(self) -> torch.Tensor:
         """Check if all predicate constraints are satisfied."""
-        for pred, (min_count, max_count) in self.predicate_constraints.items():
-            count = self._get_count(pred, state)
+        satisfied = torch.ones(self.state.batch_size, dtype=torch.bool)
 
-            # Must meet minimum count
-            if min_count is not None and count < min_count:
-                return False
-            # Must not exceed maximum count
-            if max_count is not None and count > max_count:
-                return False
+        for pred, (min_count, max_count) in self.predicate_constraints.items():
+            count = self._get_count(pred)
+
+            if min_count is not None:
+                satisfied &= count >= min_count
+            if max_count is not None:
+                satisfied &= count <= max_count
 
         # For trigger window, constraints are satisfied as soon as met
         if self.name == "trigger":
-            return True
+            return satisfied
 
         # For other windows, need to wait for window end
         if isinstance(self.end_bound, TemporalBound):
-            return state.end_time is not None
+            return satisfied & ~torch.isnan(self.state.end_time)
         else:
-            predicate = self.end_bound.predicate
-            if isinstance(predicate, str):
+            if isinstance(self.end_bound.predicate, str):
                 raise NotImplementedError("Non-Predicate window End Event Bound predicates not yet supported")
-                # predicate = [int(self.end_bound.predicate)]
-            return self.end_bound.predicate.check_constraints(state, 1, None)
+            return satisfied & self.end_bound.predicate.check_constraints(self.state, 1, None)
 
-    def _check_constraints_impossible(self, state: WindowState) -> bool:
+    def _check_constraints_impossible(self) -> torch.Tensor:
         """Check if constraints are impossible to satisfy."""
+        impossible = torch.zeros(self.state.batch_size, dtype=torch.bool)
+
         for pred, (min_count, max_count) in self.predicate_constraints.items():
-            count = self._get_count(pred, state)
+            count = self._get_count(pred)
 
-            # If we've exceeded max count
-            if max_count is not None and count > max_count:
-                return True
+            if max_count is not None:
+                impossible |= count > max_count
 
-            # If window ended and we haven't hit min count
-            if state.end_time and min_count is not None and count < min_count:
-                return True
+            if min_count is not None:
+                end_time_set = ~torch.isnan(self.state.end_time)
+                impossible |= end_time_set & (count < min_count)
 
-        return False
+        return impossible
 
     def update(
         self,
-        batch_idx: int,
-        time_delta: float,
-        event_token: int,
-        numeric_values: float,
-        parent_state: WindowState | None = None,
-    ) -> WindowStatus:
-        """Update state for specific batch element."""
+        time_deltas: torch.Tensor,
+        event_tokens: torch.Tensor,
+        numeric_values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Update state for batch."""
         if self.ignore:
-            return WindowStatus.SATISFIED
-        state = self.batch_states[batch_idx]
+            return torch.full_like(self.state.status, WindowStatus.SATISFIED.value)
 
-        # If we were waiting for next time point to confirm window end
-        if state.waiting_for_next_time is not None:
-            if time_delta > state.waiting_for_next_time:
-                state.status = WindowStatus.SATISFIED
-                state.waiting_for_next_time = None
-                self._check_label(state)
+        # Handle waiting for next time point
+        waiting_mask = ~torch.isnan(self.state.waiting_for_next_time)
+        if waiting_mask.any():
+            past_wait_time = time_deltas > self.state.waiting_for_next_time
+            newly_satisfied = waiting_mask & past_wait_time
+            still_waiting = waiting_mask & ~past_wait_time
+
+            self.state.status = torch.where(
+                newly_satisfied, torch.tensor(WindowStatus.SATISFIED.value), self.state.status
+            )
+            if newly_satisfied.any():
+                self._check_label()
+
+            # Update counts for those still waiting
+            if still_waiting.any():
+                self._update_counts(event_tokens, numeric_values)
+
+            # Clear waiting times for satisfied sequences
+            self.state.waiting_for_next_time = torch.where(
+                newly_satisfied, torch.tensor(float("nan")), self.state.waiting_for_next_time
+            )
+
+        # Don't update if already determined
+        active_mask = (self.state.status != WindowStatus.SATISFIED.value) & (
+            self.state.status != WindowStatus.IMPOSSIBLE.value
+        )
+
+        if not active_mask.any():
+            return self.state.status
+
+        # Check window start
+        start_mask = active_mask & torch.isnan(self.state.start_time)
+        should_start = self._check_start_condition(time_deltas, event_tokens)
+        new_starts = start_mask & should_start
+
+        if new_starts.any():
+            self.state.start_time = torch.where(new_starts, time_deltas, self.state.start_time)
+            self.state.in_window |= new_starts
+            self.state.status = torch.where(
+                new_starts, torch.tensor(WindowStatus.ACTIVE.value), self.state.status
+            )
+
+        # Update counts for active windows
+        update_mask = self.state.in_window & active_mask
+        if update_mask.any():
+            self._update_counts(event_tokens, numeric_values)
+            self.state.status = torch.where(
+                update_mask, torch.tensor(WindowStatus.ACTIVE.value), self.state.status
+            )
+            self._check_label()
+
+            # Check constraints
+            impossible = self._check_constraints_impossible()
+            satisfied = self._check_constraints_satisfied() | bool(self.label_value)
+
+            # Update status based on constraints
+            self.state.status = torch.where(
+                impossible & update_mask, torch.tensor(WindowStatus.IMPOSSIBLE.value), self.state.status
+            )
+            self.state.in_window &= ~(impossible & update_mask)
+
+            # Handle satisfied constraints
+            newly_satisfied = satisfied & update_mask
+            if isinstance(self.end_bound, EventBound) and self.end_bound.inclusive:
+                self.state.waiting_for_next_time = torch.where(
+                    newly_satisfied, time_deltas, self.state.waiting_for_next_time
+                )
             else:
-                self._update_counts(state, event_token, numeric_values)
-            return state.status
-
-        # If already satisfied or impossible, don't update
-        if state.status in (WindowStatus.SATISFIED, WindowStatus.IMPOSSIBLE):
-            return state.status
-
-        # Check window start if not started
-        if not state.start_time and self._check_start_condition(time_delta, event_token, batch_idx):
-            state.start_time = time_delta
-            state.in_window = True
-
-        # Update counts if in window
-        if state.in_window:
-            self._update_counts(state, event_token, numeric_values)
-            state.status = WindowStatus.ACTIVE
-
-            self._check_label(state)
-
-            # Check if constraints now impossible
-            if self._check_constraints_impossible(state):
-                state.status = WindowStatus.IMPOSSIBLE
-                state.in_window = False
-                return state.status
-
-            # Check if constraints satisfied
-            if self._check_constraints_satisfied(state) or self.label_value:
-                if isinstance(self.end_bound, EventBound) and self.end_bound.inclusive:
-                    # Wait for next time point to confirm end
-                    state.waiting_for_next_time = time_delta
-                    return state.status
-                state.status = WindowStatus.SATISFIED
-                state.in_window = False  # Close window once satisfied
-                return state.status
+                self.state.status = torch.where(
+                    newly_satisfied, torch.tensor(WindowStatus.SATISFIED.value), self.state.status
+                )
+                self.state.in_window &= ~newly_satisfied
 
         # Check window end
-        if state.in_window and self._check_end_condition(time_delta, event_token):
-            state.end_time = time_delta
-            state.in_window = False
+        should_end = self._check_end_condition(time_deltas, event_tokens)
+        end_mask = self.state.in_window & should_end
 
-            # Final constraint check at window end
-            if self._check_constraints_satisfied(state):
-                state.status = WindowStatus.SATISFIED
-            else:
-                state.status = WindowStatus.IMPOSSIBLE
+        if end_mask.any():
+            self.state.end_time = torch.where(end_mask, time_deltas, self.state.end_time)
+            self.state.in_window &= ~end_mask
 
-        return state.status
+            satisfied_at_end = self._check_constraints_satisfied()
+            self.state.status = torch.where(
+                end_mask & satisfied_at_end,
+                torch.tensor(WindowStatus.SATISFIED.value),
+                torch.where(end_mask, torch.tensor(WindowStatus.IMPOSSIBLE.value), self.state.status),
+            )
+
+        return self.state.status
+
+
+def process_node(
+    node: WindowNode,
+    tokens,
+    time_deltas,
+    numeric_values,
+) -> torch.Tensor:  # [batch_size] of status values
+    # Update this node's state
+    status = node.update(
+        time_deltas,
+        tokens,
+        numeric_values,
+    )
+
+    # If this node is satisfied, process children
+    satisfied_mask = status == WindowStatus.SATISFIED.value
+    if satisfied_mask.any() and node.children:
+        for child in node.children:
+            child_status = process_node(child, tokens, time_deltas, numeric_values)
+            # Update parent status where children are not satisfied
+            status = torch.where(
+                satisfied_mask & (child_status != WindowStatus.SATISFIED.value), child_status, status
+            )
+
+    return status
 
 
 class AutoregressiveWindowTree:
@@ -646,37 +696,7 @@ class AutoregressiveWindowTree:
         numeric_values: torch.Tensor,
     ) -> torch.Tensor:  # [batch_size] of ConstraintStatus
         """Process new tokens through tree."""
-
-        def process_node(
-            node: WindowNode, batch_idx: int, parent_state: WindowState | None = None
-        ) -> WindowStatus:
-            # Update this node's state
-            status = node.update(
-                batch_idx,
-                time_deltas[batch_idx].item(),
-                tokens[batch_idx].item(),
-                numeric_values,
-                parent_state,
-            )
-
-            # If this node is satisfied, process children
-            if status == WindowStatus.SATISFIED:
-                for child in node.children:
-                    child_status = process_node(child, batch_idx, node.batch_states[batch_idx])
-                    # Node only satisfied if all children satisfied
-                    if child_status != WindowStatus.SATISFIED:
-                        status = child_status
-                        break
-
-            return status
-
-        # Process each sequence in batch
-        results = []
-        for i in range(self.batch_size):
-            status = process_node(self.root, i)
-            results.append(status)
-
-        return torch.tensor([s.value for s in results])
+        return process_node(self.root, tokens, time_deltas, numeric_values)
 
 
 def calculate_index_timestamp_info(tree: AutoregressiveWindowTree) -> tuple[float, list[str], str]:
