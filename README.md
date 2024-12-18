@@ -81,7 +81,7 @@ windows:
 2. Create task configuration:
 
 ```python
-from czsl import create_zero_shot_task
+from clinical_zeroshot_labeler import create_zero_shot_task
 
 # Map token IDs to predicate codes
 token_map = {

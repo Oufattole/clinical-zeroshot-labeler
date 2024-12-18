@@ -6,7 +6,7 @@ import torch
 from aces.config import TaskExtractorConfig
 from loguru import logger
 
-from czsl.labeler import (
+from clinical_zeroshot_labeler.labeler import (
     AutoregressiveWindowTree,
     EventBound,
     PredicateTensor,
