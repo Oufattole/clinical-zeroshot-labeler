@@ -104,22 +104,23 @@ class PredicateTensor:
         ...     children=[],
         ...     is_and=False
         ... )
-        >>> state = WindowState()
+        >>> state = WindowState(1)
 
         >>> # Test normal lab value
-        >>> lab_predicate.update_counts(state, 6, 1.5)  # Lab below threshold
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([1.5]))  # Lab below threshold
         >>> state.predicate_counts
-        {'high_lab': 0}
+        {'high_lab': tensor([0])}
 
         >>> # Test high lab value
-        >>> lab_predicate.update_counts(state, 6, 2.5)  # Lab above threshold
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([2.5]))  # Lab above threshold
         >>> state.predicate_counts
-        {'high_lab': 1}
+        {'high_lab': tensor([1])}
 
         >>> # Test edge case exactly at threshold
-        >>> lab_predicate.update_counts(state, 7, 2.0)  # Lab at threshold (inclusive)
+        >>> # Lab at threshold (inclusive)
+        >>> lab_predicate.update_counts(state, torch.tensor([7]), torch.tensor([2.0]))
         >>> state.predicate_counts
-        {'high_lab': 2}
+        {'high_lab': tensor([2])}
 
     Derived predicates example:
         >>> # Create child predicates
@@ -149,24 +150,25 @@ class PredicateTensor:
         ...     children=[high_lab, low_lab],
         ...     is_and=False
         ... )
-        >>> state = WindowState()
+        >>> state = WindowState(1)
 
         >>> # Test high value
-        >>> abnormal_lab.update_counts(state, 6, 3.0)
+
+        >>> abnormal_lab.update_counts(state, torch.tensor([6]), torch.tensor([3.0]))
         >>> state.predicate_counts
-        {'high_lab': 1, 'low_lab': 0}
+        {'high_lab': tensor([1]), 'low_lab': tensor([0])}
         >>> abnormal_lab.get_count(state)
-        1
+        tensor([1])
 
         >>> # Test low value
-        >>> abnormal_lab.update_counts(state, 6, -2.5)
+        >>> abnormal_lab.update_counts(state, torch.tensor([6]), torch.tensor([-2.5]))
         >>> state.predicate_counts
-        {'high_lab': 1, 'low_lab': 1}
+        {'high_lab': tensor([1]), 'low_lab': tensor([1])}
         >>> abnormal_lab.get_count(state)  # OR predicate sums the counts
-        2
+        tensor([2])
 
     Constraint checking:
-        >>> state = WindowState()
+        >>> state = WindowState(1)
         >>> lab_predicate = PredicateTensor(
         ...     name="high_lab",
         ...     tokens=torch.tensor([6]),
@@ -178,18 +180,18 @@ class PredicateTensor:
 
         >>> # Test min/max constraints
         >>> lab_predicate.check_constraints(state, min_count=1, max_count=3)  # No events yet
-        False
-        >>> lab_predicate.update_counts(state, 6, 2.5)  # Add qualifying event
+        tensor([False])
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([2.5]))  # Add qualifying event
         >>> lab_predicate.check_constraints(state, min_count=1, max_count=3)  # Now satisfied
-        True
-        >>> lab_predicate.update_counts(state, 6, 3.0)  # Add another
-        >>> lab_predicate.update_counts(state, 6, 3.0)  # And another
-        >>> lab_predicate.update_counts(state, 6, 3.0)  # One too many
+        tensor([True])
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([3.0]))  # Add another
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([3.0]))  # And another
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([3.0]))  # One too many
         >>> lab_predicate.check_constraints(state, min_count=1, max_count=3)  # Exceeds max
-        False
+        tensor([False])
 
     Impossibility checking:
-        >>> state = WindowState()
+        >>> state = WindowState(1)
         >>> lab_predicate = PredicateTensor(
         ...     name="high_lab",
         ...     tokens=torch.tensor([6]),
@@ -201,30 +203,137 @@ class PredicateTensor:
 
         >>> # Test max constraint
         >>> lab_predicate.check_impossible(state, max_count=2)  # No events
-        False
-        >>> lab_predicate.update_counts(state, 6, 3.0)
-        >>> lab_predicate.update_counts(state, 6, 3.0)
+        tensor([False])
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([3.0]))
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([3.0]))
         >>> lab_predicate.check_impossible(state, max_count=2)  # At limit
-        False
-        >>> lab_predicate.update_counts(state, 6, 3.0)
+        tensor([False])
+        >>> lab_predicate.update_counts(state, torch.tensor([6]), torch.tensor([3.0]))
         >>> lab_predicate.check_impossible(state, max_count=2)  # Over limit
-        True
+        tensor([True])
     """
 
     name: str
-    tokens: torch.Tensor
+    tokens: torch.Tensor  # [num_tokens] of vocabulary indices
     value_limits: tuple[float | None, float | None]
     value_inclusions: tuple[bool | None, bool | None]
     children: list["PredicateTensor"]
     is_and: bool
 
+    def update_counts(self, state: WindowState, tokens: torch.Tensor, values: torch.Tensor) -> None:
+        """
+        Update counts for tokens and values in batch.
+
+        Args:
+            state: WindowState with batch_size dimension
+            tokens: [batch_size] tensor of token indices
+            values: [batch_size] tensor of numeric values
+        """
+        if not self.children:
+            # Plain predicate case
+            # Initialize predicate count if needed
+            if self.name not in state.predicate_counts:
+                state.predicate_counts[self.name] = torch.zeros(state.batch_size, dtype=torch.long)
+
+            # Create mask for matching tokens
+            token_mask = torch.zeros_like(tokens, dtype=torch.bool)
+            for vocab_token in self.tokens:
+                token_mask |= tokens == vocab_token
+
+            if not token_mask.any():
+                return
+
+            # Check value thresholds
+            min_val, max_val = self.value_limits
+            min_incl, max_incl = self.value_inclusions
+
+            should_count = torch.ones_like(tokens, dtype=torch.bool)
+
+            # Check minimum threshold
+            if min_val is not None:
+                if min_incl:
+                    should_count &= values >= min_val
+                else:
+                    should_count &= values > min_val
+
+            # Check maximum threshold
+            if max_val is not None:
+                if max_incl:
+                    should_count &= values <= max_val
+                else:
+                    should_count &= values < max_val
+
+            # Update counts where both token matches and value constraints are met
+            increment_mask = token_mask & should_count
+            state.predicate_counts[self.name] += increment_mask.long()
+        else:
+            # Derived predicate case - update all children
+            for child in self.children:
+                child.update_counts(state, tokens, values)
+
+    def get_count(self, state: WindowState) -> torch.Tensor:
+        """
+        Get total count for this predicate across batch.
+
+        Returns:
+            [batch_size] tensor of counts
+        """
+        if not self.children:
+            # Plain predicate - return stored count
+            return state.predicate_counts.get(self.name, torch.zeros(state.batch_size, dtype=torch.long))
+
+        # Derived predicate - combine child counts
+        child_counts = torch.stack([child.get_count(state) for child in self.children])
+
+        if self.is_and:
+            # AND - use minimum count across children
+            return (
+                torch.min(child_counts, dim=0)[0]
+                if child_counts.size(0) > 0
+                else torch.zeros(state.batch_size, dtype=torch.long)
+            )
+        else:
+            # OR - use sum of counts
+            return torch.sum(child_counts, dim=0)
+
+    def check_constraints(
+        self, state: WindowState, min_count: int | None, max_count: int | None
+    ) -> torch.Tensor:
+        """
+        Check if count constraints are satisfied across batch.
+
+        Returns:
+            [batch_size] boolean tensor
+        """
+        counts = self.get_count(state)
+        satisfied = torch.ones(state.batch_size, dtype=torch.bool)
+
+        if min_count is not None:
+            satisfied &= counts >= min_count
+
+        if max_count is not None:
+            satisfied &= counts <= max_count
+
+        return satisfied
+
+    def check_impossible(self, state: WindowState, max_count: int | None) -> torch.Tensor:
+        """
+        Check if constraints are impossible to satisfy across batch.
+
+        Returns:
+            [batch_size] boolean tensor
+        """
+        if max_count is None:
+            return torch.zeros(state.batch_size, dtype=torch.bool)
+
+        counts = self.get_count(state)
+        return counts > max_count
+
     @classmethod
     def from_config(
         cls, metadata_df: pl.DataFrame, config: TaskExtractorConfig, predicate_name: str
     ) -> "PredicateTensor":
-        """
-        Create a PredicateTensor from a task configuration.
-        """
+        """Create a PredicateTensor from a task configuration."""
         predicate = config.predicates[predicate_name]
 
         if isinstance(predicate, PlainPredicateConfig):
@@ -248,115 +357,20 @@ class PredicateTensor:
 
         elif isinstance(predicate, DerivedPredicateConfig):
             # Handle derived predicate - has children but no tokens
-            children = []
-
-            # Process each child predicate
-            for child_name in predicate.input_predicates:
-                child = cls.from_config(metadata_df, config, child_name)
-                children.append(child)
-
-            value_limits = (predicate.value_min, predicate.value_max)
-            value_inclusions = (predicate.value_min_inclusive, predicate.value_max_inclusive)
+            children = [
+                cls.from_config(metadata_df, config, child_name) for child_name in predicate.input_predicates
+            ]
 
             return cls(
                 name=predicate_name,
-                tokens=torch.tensor([], dtype=torch.long),  # Empty for derived predicates
-                value_limits=value_limits,  # Empty for derived predicates
-                value_inclusions=value_inclusions,  # Empty for derived predicates
+                tokens=torch.tensor([], dtype=torch.long),
+                value_limits=(None, None),
+                value_inclusions=(None, None),
                 children=children,
                 is_and=predicate.is_and,
             )
         else:
             raise ValueError(f"Unknown predicate type: {type(predicate)}")
-
-    def update_counts(self, state: WindowState, token: int, value: float) -> None:
-        """
-        Update counts for a token and value.
-
-        For plain predicates, checks if token matches and updates count if value constraints are met.
-        For derived predicates, recursively updates children.
-        """
-        if not self.children:
-            # Plain predicate case
-            # Check if this token is in our vocabulary
-            if not any(token == t.item() for t in self.tokens):
-                return
-
-            # Initialize predicate count if needed
-            if self.name not in state.predicate_counts:
-                state.predicate_counts[self.name] = 0
-
-            # Check value thresholds
-            min_val, max_val = self.value_limits
-            min_incl, max_incl = self.value_inclusions
-
-            should_count = True
-
-            # Check minimum threshold
-            if min_val is not None:
-                if min_incl:
-                    should_count = value >= min_val
-                else:
-                    should_count = value > min_val
-
-            # Check maximum threshold
-            if should_count and max_val is not None:
-                if max_incl:
-                    should_count = value <= max_val
-                else:
-                    should_count = value < max_val
-
-            if should_count:
-                state.predicate_counts[self.name] += 1
-        else:
-            # Derived predicate case - update all children
-            for child in self.children:
-                child.update_counts(state, token, value)
-
-    def get_count(self, state: WindowState) -> int:
-        """
-        Get total count for this predicate.
-
-        For plain predicates, returns the stored count.
-        For derived predicates, combines child counts according to AND/OR logic.
-        """
-        if not self.children:
-            # Plain predicate - return stored count
-            return state.predicate_counts.get(self.name, 0)
-
-        # Derived predicate - combine child counts
-        child_counts = [child.get_count(state) for child in self.children]
-
-        if self.is_and:
-            # AND - use minimum count
-            return min(child_counts) if child_counts else 0
-        else:
-            # OR - use sum of counts
-            return sum(child_counts)
-
-    def check_constraints(self, state: WindowState, min_count, max_count) -> bool:
-        """
-        Check if count constraints are satisfied.
-        """
-        count = self.get_count(state)
-        if min_count is not None and count < min_count:
-            return False
-
-        if max_count is not None and count > max_count:
-            return False
-
-        return True
-
-    def check_impossible(self, state: WindowState, max_count) -> bool:
-        """
-        Check if constraints are impossible to satisfy.
-        """
-        count = self.get_count(state)
-
-        if max_count is not None and count > max_count:
-            return True
-
-        return False
 
 
 def get_predicate_tensor(
