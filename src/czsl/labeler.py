@@ -54,6 +54,7 @@ class WindowState:
     in_window: bool = False
     predicate_counts: dict[str, int] = field(default_factory=dict)
     status: WindowStatus = WindowStatus.UNDETERMINED
+    waiting_for_next_time: float | None = None  # Used for end_inclusive event bounds, points to current time
 
     def reset(self):
         """Reset state for new sequence."""
@@ -62,6 +63,7 @@ class WindowState:
         self.in_window = False
         self.predicate_counts.clear()
         self.status = WindowStatus.UNDETERMINED
+        self.waiting_for_next_time = None
 
 
 T = None | int
@@ -325,10 +327,6 @@ class PredicateTensor:
         Check if count constraints are satisfied.
         """
         count = self.get_count(state)
-        # if self.name == 'discharge_or_death':
-        #     import pdb; pdb.set_trace()
-        #     for child in self.children: print(child.tokens)
-
         if min_count is not None and count < min_count:
             return False
 
@@ -576,28 +574,29 @@ class WindowNode:
             return WindowStatus.SATISFIED
         state = self.batch_states[batch_idx]
 
-        logger.info(f"Node {self.name} updating batch {batch_idx}:")
-        logger.info(f"  token: {event_token}, time: {time_delta}")
-        logger.info(
-            f"  current state: start={state.start_time}, end={state.end_time}, in_window={state.in_window}"
-        )
+        # If we were waiting for next time point to confirm window end
+        if state.waiting_for_next_time is not None:
+            if time_delta > state.waiting_for_next_time:
+                state.status = WindowStatus.SATISFIED
+                state.waiting_for_next_time = None
+                self._check_label(state)
+            else:
+                self._update_counts(state, event_token, numeric_values)
+            return state.status
 
         # If already satisfied or impossible, don't update
         if state.status in (WindowStatus.SATISFIED, WindowStatus.IMPOSSIBLE):
-            logger.info(f"  skipping - already {state.status}")
             return state.status
 
         # Check window start if not started
         if not state.start_time and self._check_start_condition(time_delta, event_token, batch_idx):
             state.start_time = time_delta
             state.in_window = True
-            logger.info(f"  window started at {time_delta}")
 
         # Update counts if in window
         if state.in_window:
             self._update_counts(state, event_token, numeric_values)
             state.status = WindowStatus.ACTIVE
-            logger.info(f"  updated counts: {state.predicate_counts}")
 
             self._check_label(state)
 
@@ -605,31 +604,29 @@ class WindowNode:
             if self._check_constraints_impossible(state):
                 state.status = WindowStatus.IMPOSSIBLE
                 state.in_window = False
-                logger.info("  constraints impossible")
                 return state.status
 
             # Check if constraints satisfied
             if self._check_constraints_satisfied(state) or self.label_value:
+                if isinstance(self.end_bound, EventBound) and self.end_bound.inclusive:
+                    # Wait for next time point to confirm end
+                    state.waiting_for_next_time = time_delta
+                    return state.status
                 state.status = WindowStatus.SATISFIED
                 state.in_window = False  # Close window once satisfied
-                logger.info("  constraints satisfied")
                 return state.status
 
         # Check window end
         if state.in_window and self._check_end_condition(time_delta, event_token):
             state.end_time = time_delta
             state.in_window = False
-            logger.info(f"  window ended at {time_delta}")
 
             # Final constraint check at window end
             if self._check_constraints_satisfied(state):
                 state.status = WindowStatus.SATISFIED
-                logger.info("  constraints satisfied")
             else:
                 state.status = WindowStatus.IMPOSSIBLE
-                logger.info("  constraints impossible - window ended")
 
-        logger.info(f"  final status: {state.status}")
         return state.status
 
 
@@ -811,7 +808,7 @@ def convert_task_config(
             return (
                 EventBound(
                     reference=window_name,
-                    inclusive=expr.left_inclusive,
+                    inclusive=expr.right_inclusive,
                     predicate=predicate,
                     direction=direction,
                 ),

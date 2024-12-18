@@ -304,6 +304,15 @@ def test_window_tree():
         time_deltas=torch.tensor([1.5, 1.5]),
         numeric_values=torch.tensor([0.0, 0.0]),
     )
+    logger.info(f"Expecting: Seq 1 active, Seq 2 fails. Status is: {status}")
+    assert (status == torch.tensor([1, 3])).all(), status
+
+    logger.info("\n=== Test Step 4: Death vs other event ===")
+    status = tracker.update(
+        tokens=torch.tensor([5, 5]),  # Death for seq 1, other event for seq 2
+        time_deltas=torch.tensor([2.0, 2.0]),
+        numeric_values=torch.tensor([0.0, 0.0]),
+    )
     logger.info(f"Expecting: Seq 1 completes successfully, Seq 2 fails. Status is: {status}")
     assert (status == torch.tensor([2, 3])).all(), status
 
@@ -322,7 +331,7 @@ def successful_death_sequence():
             torch.tensor([0]),  # Initial state
             torch.tensor([1]),  # Input window active
             torch.tensor([1]),  # Gap window active
-            torch.tensor([2]),  # Satisfied (death)
+            torch.tensor([1]),  # Satisfied (death)
             torch.tensor([2]),  # Remains satisfied
         ],
         "label": True,
@@ -343,7 +352,7 @@ def successful_discharge_sequence():
             torch.tensor([0]),  # Initial state
             torch.tensor([1]),  # Input window active
             torch.tensor([1]),  # Gap window active
-            torch.tensor([2]),  # Satisfied (discharge)
+            torch.tensor([1]),  # Satisfied (discharge)
             torch.tensor([2]),  # Remains satisfied
         ],
         "label": False,
@@ -392,6 +401,92 @@ def undetermined_sequence():
     }
 
 
+@pytest.fixture
+def exact_boundary_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 24.0, 0.0),  # Event exactly at input window boundary
+            (5, 48.0, 0.0),  # Event exactly at gap window boundary
+            (4, 72.1, 0.0),  # Death just after minimum time
+            (5, 72.1, 0.0),  # Death just after minimum time
+            (5, 72.2, 0.0),  # Random event after
+        ],
+        "expected_statuses": [
+            torch.tensor([0]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Gap window active
+            torch.tensor([1]),  # Waiting for next time token
+            torch.tensor([1]),  # Waiting for next time token
+            torch.tensor([2]),  # Satisfied
+        ],
+        "label": True,
+    }
+
+
+@pytest.fixture
+def boundary_exclusion_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 24.0, 0.0),  # Event at input boundary (excluded)
+            (4, 48.0, 0.0),  # Death at gap boundary (excluded)
+        ],
+        "expected_statuses": [
+            torch.tensor([0]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([3]),  # Impossible (death during gap)
+        ],
+        "label": False,
+    }
+
+
+@pytest.fixture
+def death_after_discharge_same_time_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 24.0, 0.0),  # Event at input boundary (excluded)
+            (5, 73.0, 0.0),  # Random Event
+            (4, 74.0, 0.0),  # Discharge
+            (3, 74.0, 0.0),  # Death
+            (5, 75.0, 0.0),  # Event at later time
+        ],
+        "expected_statuses": [
+            torch.tensor([0]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Input window active
+            torch.tensor([2]),  # Input window active
+        ],
+        "label": True,
+    }
+
+
+@pytest.fixture
+def death_before_discharge_same_time_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 24.0, 0.0),  # Event at input boundary (excluded)
+            (5, 73.0, 0.0),  # Random Event
+            (3, 74.0, 0.0),  # Death
+            (4, 74.0, 0.0),  # Discharge
+            (5, 75.0, 0.0),  # Event at later time
+        ],
+        "expected_statuses": [
+            torch.tensor([0]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Input window active
+            torch.tensor([2]),  # Input window active
+        ],
+        "label": True,
+    }
+
+
 @pytest.mark.parametrize(
     "sequence_fixture_name",
     [
@@ -399,6 +494,9 @@ def undetermined_sequence():
         "successful_discharge_sequence",
         "impossible_readmission_sequence",
         "undetermined_sequence",
+        "exact_boundary_sequence",
+        "boundary_exclusion_sequence",
+        "death_before_discharge_same_time_sequence",
     ],
 )
 def test_icu_mortality_sequences(icu_morality_task_config_yaml, metadata_df, sequence_fixture_name, request):
@@ -483,11 +581,49 @@ def successful_second_abnormal_lab():
     }
 
 
+@pytest.fixture
+def normal_lab_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (6, 72.0, 1.5),  # Lab event with normal value (between -2 and 2)
+            (7, 73.0, -1.8),  # Another normal lab
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Still active (no abnormal labs)
+            torch.tensor([1]),  # Still active (no abnormal labs)
+        ],
+        "label": False,  # No abnormal labs found
+    }
+
+
+@pytest.fixture
+def edge_case_lab_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (7, 73.0, -2.0),  # Lab exactly at low threshold (exclusive)
+            (6, 72.0, 2.0),  # Lab exactly at high threshold (inclusive)
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Still active
+            torch.tensor([2]),  # Satisfied (hit inclusive high threshold)
+        ],
+        "label": True,  # Abnormal lab found (high threshold inclusive)
+    }
+
+
 @pytest.mark.parametrize(
     "sequence_fixture_name",
     [
         "successful_abnormal_lab",
         "successful_second_abnormal_lab",
+        "normal_lab_sequence",
+        "edge_case_lab_sequence",
     ],
 )
 def test_abnormal_lab_sequences(abnormal_lab_task_config_yaml, metadata_df, sequence_fixture_name, request):
