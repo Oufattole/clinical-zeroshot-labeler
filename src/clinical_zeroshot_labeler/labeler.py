@@ -1,3 +1,4 @@
+import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
@@ -907,3 +908,105 @@ def convert_task_config(
     # Create tree from root
     tree = AutoregressiveWindowTree(root, batch_size)
     return tree
+
+
+@dataclass
+class SequenceLabeler:
+    """
+    Simple API for labeling sequences using clinical zero-shot labeling.
+
+    Example usage:
+        # Create labeler with your task config
+        labeler = SequenceLabeler.from_yaml_str(task_config_yaml, metadata_df)
+
+        # Process tokens
+        while not labeler.is_finished():
+            tokens, times, values = model.generate_next_token(prompts)
+            statuses = labeler.process_step(tokens, times, values)
+
+        # Get final labels
+        labels = labeler.get_labels()
+    """
+
+    tree: AutoregressiveWindowTree
+    gap_days: float
+    batch_size: int
+    _finished: bool = False
+
+    @classmethod
+    def from_yaml_str(cls, yaml_str: str, metadata_df: pl.DataFrame, batch_size: int) -> "SequenceLabeler":
+        """Create a labeler from YAML task configuration string."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
+            f.write(yaml_str)
+            f.flush()
+            task_config = TaskExtractorConfig.load(f.name)
+        return cls.from_task_config(task_config, metadata_df, batch_size)
+
+    @classmethod
+    def from_yaml_file(cls, yaml_path: str, metadata_df: pl.DataFrame, batch_size: int) -> "SequenceLabeler":
+        """Create a labeler from YAML task configuration file."""
+        task_config = TaskExtractorConfig.load(yaml_path)
+        return cls.from_task_config(task_config, metadata_df, batch_size)
+
+    @classmethod
+    def from_task_config(
+        cls, config: TaskExtractorConfig, metadata_df: pl.DataFrame, batch_size: int
+    ) -> "SequenceLabeler":
+        """Create a labeler from TaskExtractorConfig object."""
+        tree = convert_task_config(config, batch_size, metadata_df)
+        gap_days, prior_windows, _ = calculate_index_timestamp_info(tree)
+
+        # Initialize tree
+        tree.root.initialize_batch(batch_size)
+        tree.root.ignore_windows(prior_windows + ["trigger"])
+
+        return cls(tree=tree, gap_days=gap_days, batch_size=batch_size)
+
+    def process_step(
+        self,
+        tokens: torch.Tensor | list[int],
+        times: torch.Tensor | list[float],
+        values: torch.Tensor | list[float],
+    ) -> torch.Tensor:
+        """
+        Process one step of token sequences.
+
+        Args:
+            tokens: Token IDs for current step [batch_size]
+            times: Time values for current step [batch_size]
+            values: Numeric values for current step [batch_size]
+
+        Returns:
+            Tensor of status values for each sequence [batch_size]
+        """
+        # Convert inputs to tensors if needed
+        if not isinstance(tokens, torch.Tensor):
+            tokens = torch.tensor(tokens, dtype=torch.long)
+        if not isinstance(times, torch.Tensor):
+            times = torch.tensor(times, dtype=torch.float)
+        if not isinstance(values, torch.Tensor):
+            values = torch.tensor(values, dtype=torch.float)
+
+        # Ensure proper shapes
+        tokens = tokens.view(self.batch_size)
+        times = times.view(self.batch_size)
+        values = values.view(self.batch_size)
+
+        # Adjust times by gap days
+        time_deltas = times + self.gap_days
+
+        # Update tree state
+        status = self.tree.update(tokens, time_deltas, values)
+
+        # Check if we're done
+        self._finished = ((status == 2) | (status == 3)).all()
+
+        return status
+
+    def get_labels(self) -> torch.Tensor:
+        """Get final binary labels for each sequence in the batch."""
+        return self.tree.root.get_labels()
+
+    def is_finished(self) -> bool:
+        """Check if all sequences have reached a final state."""
+        return self._finished

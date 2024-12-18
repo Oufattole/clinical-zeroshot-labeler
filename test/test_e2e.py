@@ -10,6 +10,7 @@ from clinical_zeroshot_labeler.labeler import (
     AutoregressiveWindowTree,
     EventBound,
     PredicateTensor,
+    SequenceLabeler,
     TemporalBound,
     WindowNode,
     calculate_index_timestamp_info,
@@ -692,3 +693,148 @@ def test_abnormal_lab_sequences(abnormal_lab_task_config_yaml, metadata_df, sequ
 
         prompts = torch.cat([prompts, next_tokens.unsqueeze(1)], dim=1)
     assert sequence_data["label"] == any(tree.root.get_labels())
+
+
+class SimpleGenerativeModel:
+    """A simple mock generative model that returns predefined sequences."""
+
+    def __init__(self, sequences: list[list[tuple[int, float, float]]]):
+        """
+        Args:
+            sequences: List of sequences, where each sequence is a list of
+                      (token, time, value) tuples
+        """
+        self.sequences = sequences
+        self.current_positions = [0] * len(sequences)
+        self.batch_size = len(sequences)
+
+    def generate_next_token(self, prompt: torch.Tensor):
+        """Simulate generating the next token for each sequence in the batch."""
+        tokens = []
+        times = []
+        values = []
+
+        for i, seq in enumerate(self.sequences):
+            if self.current_positions[i] < len(seq):
+                token, time, value = seq[self.current_positions[i]]
+                self.current_positions[i] += 1
+            else:
+                # For finished sequences, repeat last values
+                token, time, value = seq[-1]
+            tokens.append(token)
+            times.append(time)
+            values.append(value)
+
+        return (
+            torch.tensor(tokens, dtype=torch.long),
+            torch.tensor(times, dtype=torch.float),
+            torch.tensor(values, dtype=torch.float),
+        )
+
+    def is_finished(self):
+        """Check if all sequences have been fully processed."""
+        return all(pos >= len(seq) for pos, seq in zip(self.current_positions, self.sequences))
+
+
+@pytest.mark.parametrize(
+    "sequence_fixture_name",
+    [
+        "successful_death_sequence",
+        "successful_discharge_sequence",
+        "impossible_readmission_sequence",
+        "undetermined_sequence",
+        "exact_boundary_sequence",
+        "boundary_exclusion_sequence",
+        "death_after_discharge_same_time_sequence",
+        "death_before_discharge_same_time_sequence",
+        "multiple_sequences",
+    ],
+)
+def test_sequence_labeler_mortality(
+    icu_morality_task_config_yaml, metadata_df, sequence_fixture_name, request
+):
+    """Test SequenceLabeler with various ICU mortality sequences."""
+    # Get sequence data from fixture
+    sequence_data = request.getfixturevalue(sequence_fixture_name)
+    sequence = sequence_data["sequence"]
+    expected_statuses = sequence_data["expected_statuses"]
+    batch_size = 1 if isinstance(sequence[0][0], int) else len(sequence[0][0])
+
+    # Create labeler
+    labeler = SequenceLabeler.from_yaml_str(icu_morality_task_config_yaml, metadata_df, batch_size=batch_size)
+
+    # Set up model
+    model = SimpleGenerativeModel([sequence])
+    prompts = torch.zeros((batch_size), dtype=torch.long)
+
+    # Process each step
+    for step, expected_status in enumerate(expected_statuses):
+        next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
+        # Convert times to days by dividing by 24 like in original test
+        next_times = next_times / 24.0
+        status = labeler.process_step(next_tokens, next_times, numeric_values)
+
+        assert torch.equal(
+            status, expected_status
+        ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
+
+        if not model.is_finished():
+            prompts = next_tokens
+
+    # Check final labels
+    labels = labeler.get_labels()
+    expected_labels = (
+        torch.tensor(sequence_data["label"])
+        if isinstance(sequence_data["label"], list)
+        else torch.tensor([sequence_data["label"]])
+    )
+
+    assert torch.equal(
+        labels & (status == torch.tensor(2)), expected_labels
+    ), f"{sequence_fixture_name}: Expected labels {expected_labels}, got {labels}"
+
+
+@pytest.mark.parametrize(
+    "sequence_fixture_name",
+    [
+        "successful_abnormal_lab",
+        "successful_second_abnormal_lab",
+        "normal_lab_sequence",
+        "edge_case_lab_sequence",
+    ],
+)
+def test_sequence_labeler_lab_values(
+    abnormal_lab_task_config_yaml, metadata_df, sequence_fixture_name, request
+):
+    """Test SequenceLabeler with various lab value sequences."""
+    # Get sequence data from fixture
+    sequence_data = request.getfixturevalue(sequence_fixture_name)
+    sequence = sequence_data["sequence"]
+    expected_statuses = sequence_data["expected_statuses"]
+
+    # Create labeler
+    labeler = SequenceLabeler.from_yaml_str(abnormal_lab_task_config_yaml, metadata_df, batch_size=1)
+
+    # Set up model
+    model = SimpleGenerativeModel([sequence])
+    prompts = torch.zeros((1, 1), dtype=torch.long)
+
+    # Test each step
+    for step, expected_status in enumerate(expected_statuses):
+        next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
+        # Convert times to days
+        next_times = next_times / 24.0
+        status = labeler.process_step(next_tokens, next_times, numeric_values)
+
+        assert torch.equal(
+            status, expected_status
+        ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
+
+        if not model.is_finished():
+            prompts = torch.cat([prompts, next_tokens.unsqueeze(1)], dim=1)
+
+    # Check final labels
+    labels = labeler.get_labels()
+    assert sequence_data["label"] == any(
+        labels
+    ), f"{sequence_fixture_name}: Expected label {sequence_data['label']}, got {labels}"
