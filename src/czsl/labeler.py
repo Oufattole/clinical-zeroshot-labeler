@@ -236,9 +236,7 @@ class PredicateTensor:
                 state.predicate_counts[self.name] = torch.zeros(state.batch_size, dtype=torch.long)
 
             # Create mask for matching tokens
-            token_mask = torch.zeros_like(tokens, dtype=torch.bool)
-            for vocab_token in self.tokens:
-                token_mask |= tokens == vocab_token
+            token_mask = (tokens.unsqueeze(1) == self.tokens.unsqueeze(0)).any(dim=1)
 
             if not token_mask.any():
                 return
@@ -462,11 +460,17 @@ class WindowNode:
     label_value: bool | None = None
 
     def get_labels(self):
-        labels = []
-        labels.append(self.label_value)
-        for node in self.children:
-            labels.extend(node.get_labels())
-        return labels
+        if self.label is not None:
+            if self.label_value is not None:
+                return self.label_value
+            else:
+                return torch.zeros((self.state.batch_size), dtype=torch.bool)
+        else:
+            for node in self.children:
+                label = node.get_labels()
+                if label is not None:
+                    return label
+            return None
 
     def ignore_windows(self, window_names: list[str]):
         if self.name in window_names:
@@ -484,7 +488,7 @@ class WindowNode:
     def _check_label(self) -> None:
         if self.label is not None:
             label_counts = self._get_count(self.label)
-            self.label_value = bool(torch.any(label_counts > 0).item())
+            self.label_value = label_counts > 0
 
     def _check_start_condition(self, time_delta: torch.Tensor, event_token: torch.Tensor) -> torch.Tensor:
         """Check if window should start at current time/event."""
@@ -524,8 +528,7 @@ class WindowNode:
 
     def _get_count(self, predicate_id: str) -> torch.Tensor:
         predicate_tensor = self.tensorized_predicates[predicate_id]
-        # TODO: tensorize predicate_tensor
-        return torch.tensor(predicate_tensor.get_count(self.state))
+        return predicate_tensor.get_count(self.state)
 
     def _check_constraints_satisfied(self) -> torch.Tensor:
         """Check if all predicate constraints are satisfied."""
