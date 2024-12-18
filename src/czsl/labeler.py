@@ -488,6 +488,7 @@ class WindowNode:
     def _check_label(self) -> None:
         if self.label is not None:
             label_counts = self._get_count(self.label)
+            # TODO: Consider if we need to consider self.state.status impossible cases when updating labels
             self.label_value = label_counts > 0
 
     def _check_start_condition(self, time_delta: torch.Tensor, event_token: torch.Tensor) -> torch.Tensor:
@@ -633,7 +634,9 @@ class WindowNode:
 
             # Check constraints
             impossible = self._check_constraints_impossible()
-            satisfied = self._check_constraints_satisfied() | bool(self.label_value)
+            satisfied = self._check_constraints_satisfied()
+            if self.label_value is not None:
+                satisfied = satisfied | self.label_value
 
             # Update status based on constraints
             self.state.status = torch.where(
