@@ -14,157 +14,123 @@ By leveraging the ACES schema, you can define complex clinical tasks like:
 
 - ICU mortality prediction
 - Lab value forecasting
-- Treatment response prediction
 - Readmission risk assessment
+- etc.
 
 All without needing to modify code or retrain models, and maintaining compatibility with existing ACES configurations.
-
-## About ACES
-
-ACES (Automated Cohort and Event Selection) is a framework for defining clinical tasks through a structured YAML schema. Originally designed for:
-
-- Cohort extraction from clinical data
-- Binary classification task definition
-- Temporal relationship specification
-- Event sequence validation
-
-This library extends ACES to work with generative models by:
-
-- Converting ACES predicates into generation stopping criteria
-- Using ACES windows to control sequence length and timing
-- Applying ACES labeling logic to generated sequences
 
 ## Installation
 
 ```bash
-git clone git@github.com:Oufattole/clinical-zeroshot-labeler.git
-cd clinical-zeroshot-labeler
-pip install -e .[tests,dev]
+pip install clinical-zeroshot-labeler
 ```
 
 ## Quick Start
 
-1. Define your task in a YAML file:
+1. Define your task in YAML:
 
 ```yaml
 predicates:
-  icu_admission:
-    code: event_type//ICU_ADMISSION
-  death:
-    code: event_type//DEATH
-  discharge:
-    code: event_type//DISCHARGE
-  death_or_discharge:
-    expr: or(death, discharge)
+  hospital_discharge:
+    code: {regex: HOSPITAL_DISCHARGE//.*}
+  lab:
+    code: {regex: LAB//.*}
+  abnormal_lab:
+    code: {regex: LAB//.*}
+    value_min: 2.0
+    value_min_inclusive: true
 
-trigger: icu_admission
+trigger: hospital_discharge
 
 windows:
-  observation:
+  input:
     start:
-    end: trigger + 24h
+    end: trigger
     start_inclusive: true
     end_inclusive: true
-    has:
-      _ANY_EVENT: (1, None)
     index_timestamp: end
-
-  outcome:
-    start: observation.end
-    end: start -> death_or_discharge
+  target:
+    start: input.end
+    end: start + 4d
     start_inclusive: false
     end_inclusive: true
-    has: {}
-    label: death
+    has:
+      lab: (1, None)
+    label: abnormal_lab
 ```
 
-2. Create task configuration:
+2. Set up your metadata mapping:
 
 ```python
-from clinical_zeroshot_labeler import create_zero_shot_task
+import polars as pl
 
-# Map token IDs to predicate codes
-token_map = {
-    0: "event_type//ICU_ADMISSION",
-    1: "event_type//DEATH",
-    2: "event_type//DISCHARGE",
-}
-
-# Create task config
-task_config = create_zero_shot_task(
-    yaml_path="icu_mortality.yaml", token_to_code_map=token_map
-)
+# Load a metadata mapping of medical codes to vocabulary indices your generative model generates
+metadata_df = pl.DataFrame(
+    {
+        "code": [
+            "PAD",
+            "HOSPITAL_DISCHARGE//MEDICAL",
+            "LAB//NORMAL",
+            "LAB//HIGH",
+        ]
+    }
+).with_row_index("code/vocab_index")
 ```
 
-3. Generate sequences and get labels:
+3. Process sequences and get labels:
 
 ```python
-# Generate sequences
-outputs, lengths = generate_with_task(
-    model=model, prompts=prompts, task_config=task_config, temperature=0.7
-)
+from clinical_zeroshot_labeler import SequenceLabeler
+
+# Initialize labeler
+labeler = SequenceLabeler.from_yaml_str(task_config_yaml, metadata_df, batch_size=2)
+
+# Process tokens one at a time
+while not labeler.is_finished():
+    # Get next tokens from your model
+    tokens, times, values = model.generate_next_token(prompts)
+
+    # Update labeler state
+    status = labeler.process_step(tokens, times, values)
+    print(
+        f"Status: {status}"
+    )  # Shows 0=Undetermined, 1=Active, 2=Satisfied, 3=Impossible
+
+    # Update your model's prompts as needed
+    prompts = tokens
+
+# Get final labels
+labels = labeler.get_labels()
+```
+
+See the `notebooks/tutorial.ipynb` to run the SequenceLabeler on a mocked Generator.
+
+## API Reference
+
+### SequenceLabeler
+
+Main class for processing sequences and extracting labels:
+
+```python
+# Create from YAML string
+labeler = SequenceLabeler.from_yaml_str(yaml_str, metadata_df, batch_size)
+
+# Create from YAML file
+labeler = SequenceLabeler.from_yaml_file(yaml_path, metadata_df, batch_size)
+
+# Process tokens (returns status tensor)
+status = labeler.process_step(tokens, times, values)
+
+# Check if finished
+is_done = labeler.is_finished()
 
 # Get labels
-labeler = task_config.get_task_labeler()
-labels, unknown = labeler(trajectory_batch)
+labels = labeler.get_labels()
 ```
 
-## Task Configuration
+The labeler tracks window states for each sequence:
 
-ACES Tasks are defined through YAML files with two main components:
-
-### Predicates
-
-Define events and conditions to match:
-
-```yaml
-predicates:
-  # Simple event
-  icu_admission:
-    code: event_type//ICU_ADMISSION
-
-  # Event with numeric criteria
-  high_glucose:
-    code: GLUCOSE
-    value_min: 180
-    value_max:
-
-  # Composite predicate
-  any_critical:
-    expr: or(high_glucose, low_bp)
-```
-
-### Windows
-
-Define temporal relationships and constraints:
-
-```yaml
-windows:
-  # Observation window
-  observation:
-    start:       # Start of record
-    end: trigger + 24h
-    start_inclusive: true
-    end_inclusive: true
-    has:
-      _ANY_EVENT: (1, None)
-
-  # Prediction window
-  outcome:
-    start: observation.end
-    end: start -> death_or_discharge
-    start_inclusive: false
-    end_inclusive: true
-    has: {}
-    label: death
-```
-
-## Generation Control
-
-The configuration automatically handles:
-
-- EOS tokens based on ACES task predicates in the prediction window
-  - Edge cases such as `end_inclusive` are also handled.
-- Time-based stopping based on the ACES task predicates and prediction window end time
-- Sequence length limits, that are separately added by users. If a sequence length limit
-  is imposed and generation does not complete by that sequence limit, an unknown label is returned.
+- `0`: Undetermined - Initial state
+- `1`: Active - Currently processing
+- `2`: Satisfied - Success/completion
+- `3`: Impossible - Failed/invalid
