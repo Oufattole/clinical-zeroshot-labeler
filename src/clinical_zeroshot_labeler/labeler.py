@@ -1,3 +1,4 @@
+import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
@@ -907,3 +908,121 @@ def convert_task_config(
     # Create tree from root
     tree = AutoregressiveWindowTree(root, batch_size)
     return tree
+
+
+TimeScale = Literal["Y", "M", "W", "D", "h", "m", "s"]
+
+
+@dataclass
+class SequenceLabeler:
+    tree: AutoregressiveWindowTree
+    gap_days: float
+    batch_size: int
+    time_scale: TimeScale = "D"  # Default to days
+    _finished: bool = False
+
+    def _convert_to_days(self, times: torch.Tensor) -> torch.Tensor:
+        """Convert times from the specified time scale to days."""
+        if self.time_scale == "Y":
+            return times * 365  # Approximate
+        elif self.time_scale == "M":
+            return times * 30  # Approximate
+        elif self.time_scale == "W":
+            return times * 7
+        elif self.time_scale == "D":
+            return times
+        elif self.time_scale == "h":
+            return times / 24
+        elif self.time_scale == "m":
+            return times / (24 * 60)
+        elif self.time_scale == "s":
+            return times / (24 * 60 * 60)
+        else:
+            raise ValueError(f"Unknown time scale: {self.time_scale}")
+
+    @classmethod
+    def from_yaml_str(
+        cls, yaml_str: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+    ) -> "SequenceLabeler":
+        """Create a labeler from YAML task configuration string."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
+            f.write(yaml_str)
+            f.flush()
+            task_config = TaskExtractorConfig.load(f.name)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
+
+    @classmethod
+    def from_yaml_file(
+        cls, yaml_path: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+    ) -> "SequenceLabeler":
+        """Create a labeler from YAML task configuration file."""
+        task_config = TaskExtractorConfig.load(yaml_path)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
+
+    @classmethod
+    def from_task_config(
+        cls,
+        config: TaskExtractorConfig,
+        metadata_df: pl.DataFrame,
+        batch_size: int,
+        time_scale: TimeScale = "D",
+    ) -> "SequenceLabeler":
+        """Create a labeler from TaskExtractorConfig object."""
+        tree = convert_task_config(config, batch_size, metadata_df)
+        gap_days, prior_windows, _ = calculate_index_timestamp_info(tree)
+
+        # Initialize tree
+        tree.root.initialize_batch(batch_size)
+        tree.root.ignore_windows(prior_windows + ["trigger"])
+
+        return cls(tree=tree, gap_days=gap_days, batch_size=batch_size, time_scale=time_scale)
+
+    def process_step(
+        self,
+        tokens: torch.Tensor | list[int],
+        times: torch.Tensor | list[float],
+        values: torch.Tensor | list[float],
+    ) -> torch.Tensor:
+        """
+        Process one step of token sequences.
+
+        Args:
+            tokens: Token IDs for current step [batch_size]
+            times: Time values for current step [batch_size] in specified time_scale units
+            values: Numeric values for current step [batch_size]
+
+        Returns:
+            Tensor of status values for each sequence [batch_size]
+        """
+        # Convert inputs to tensors if needed
+        if not isinstance(tokens, torch.Tensor):
+            tokens = torch.tensor(tokens, dtype=torch.long)
+        if not isinstance(times, torch.Tensor):
+            times = torch.tensor(times, dtype=torch.float)
+        if not isinstance(values, torch.Tensor):
+            values = torch.tensor(values, dtype=torch.float)
+
+        # Ensure proper shapes
+        tokens = tokens.view(self.batch_size)
+        times = times.view(self.batch_size)
+        values = values.view(self.batch_size)
+
+        # Convert times to days and adjust by gap days
+        times_in_days = self._convert_to_days(times)
+        time_deltas = times_in_days + self.gap_days
+
+        # Update tree state
+        status = self.tree.update(tokens, time_deltas, values)
+
+        # Check if we're done
+        self._finished = ((status == 2) | (status == 3)).all()
+
+        return status
+
+    def get_labels(self) -> torch.Tensor:
+        """Get final binary labels for each sequence in the batch."""
+        return self.tree.root.get_labels()
+
+    def is_finished(self) -> bool:
+        """Check if all sequences have reached a final state."""
+        return self._finished
