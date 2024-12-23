@@ -82,6 +82,110 @@ class WindowState:
 T = None | int
 
 
+def get_meds_expr(predicate: PlainPredicateConfig) -> pl.Expr:
+    """Returns a Polars expression that evaluates this predicate for a MEDS formatted dataset.
+
+    Note: The output syntax for the following examples is dependent on the polars version used. The
+    expected outputs have been validated on polars version 0.20.30.
+
+    Examples:
+        >>> expr = get_meds_expr(PlainPredicateConfig("BP//systolic", 120, 140, True, False))
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//systolic))]
+        >>> cfg = PlainPredicateConfig("BP//systolic", value_min=120, value_min_inclusive=False)
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//systolic))]
+        >>> cfg = PlainPredicateConfig("BP//systolic", value_max=140, value_max_inclusive=True)
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//systolic))]
+        >>> cfg = PlainPredicateConfig("BP//diastolic")
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//diastolic))]
+        >>> cfg = PlainPredicateConfig("BP//diastolic", other_cols={"chamber": "atrial"})
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//diastolic))].all_horizontal([[(col("chamber")) ==
+            (String(atrial))]])
+
+        >>> cfg = PlainPredicateConfig(code={'regex': None, 'any': None})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Only one of 'regex' or 'any' can be specified in the code field!
+        Got: ['regex', 'any'].
+        >>> cfg = PlainPredicateConfig(code={'foo': None})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid specification in the code field! Got: {'foo': None}.
+        Expected one of 'regex', 'any'.
+        >>> cfg = PlainPredicateConfig(code={'regex': ''})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid specification in the code field! Got: {'regex': ''}.
+        Expected a non-empty string for 'regex'.
+        >>> cfg = PlainPredicateConfig(code={'any': []})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid specification in the code field! Got: {'any': []}.
+        Expected a list of strings for 'any'.
+
+        >>> cfg = PlainPredicateConfig(code={'regex': '^foo.*'})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        col("code").str.contains([String(^foo.*)])
+        >>> cfg = PlainPredicateConfig(code={'any': ['foo', 'bar']})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        col("code").is_in([Series])
+    """
+    criteria = []
+    if isinstance(predicate.code, dict):
+        if len(predicate.code) > 1:
+            raise ValueError(
+                "Only one of 'regex' or 'any' can be specified in the code field! "
+                f"Got: {list(predicate.code.keys())}."
+            )
+
+        if "regex" in predicate.code:
+            if not predicate.code["regex"] or not isinstance(predicate.code["regex"], str):
+                raise ValueError(
+                    "Invalid specification in the code field! "
+                    f"Got: {predicate.code}. "
+                    "Expected a non-empty string for 'regex'."
+                )
+            criteria.append(pl.col("code").str.contains(predicate.code["regex"]))
+        elif "any" in predicate.code:
+            if not predicate.code["any"] or not isinstance(predicate.code["any"], list):
+                raise ValueError(
+                    "Invalid specification in the code field! "
+                    f"Got: {predicate.code}. "
+                    f"Expected a list of strings for 'any'."
+                )
+            criteria.append(pl.Expr.is_in(pl.col("code"), predicate.code["any"]))
+        else:
+            raise ValueError(
+                "Invalid specification in the code field! "
+                f"Got: {predicate.code}. "
+                "Expected one of 'regex', 'any'."
+            )
+    else:
+        criteria.append(pl.col("code") == predicate.code)
+
+    if predicate.other_cols:
+        criteria.extend([pl.col(col) == value for col, value in predicate.other_cols.items()])
+
+    if len(criteria) == 1:
+        return criteria[0]
+    else:
+        return pl.all_horizontal(criteria)
+
+
 @dataclass
 class PredicateTensor:
     """
@@ -337,7 +441,7 @@ class PredicateTensor:
 
         if isinstance(predicate, PlainPredicateConfig):
             # Handle plain predicate - has tokens but no children
-            tokens = metadata_df.filter(predicate.MEDS_eval_expr())["code/vocab_index"].to_torch()
+            tokens = metadata_df.filter(get_meds_expr(predicate))["code/vocab_index"].to_torch()
 
             if tokens.shape[0] == 0:
                 logger.warning(f"Predicate {predicate_name} matched no codes")
@@ -393,7 +497,7 @@ def get_predicate_tensor(
 
     if isinstance(predicate, PlainPredicateConfig):
         # Handle plain predicate
-        predicate_tensor = metadata_df.filter(predicate.MEDS_eval_expr())["code/vocab_index"].to_torch()
+        predicate_tensor = metadata_df.filter(get_meds_expr(predicate))["code/vocab_index"].to_torch()
 
         if predicate_tensor.shape[0] == 0:
             logger.warning(f"Predicate {predicate_name} returned no rows. Skipping it.")
