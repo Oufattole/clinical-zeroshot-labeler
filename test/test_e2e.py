@@ -452,6 +452,7 @@ def exact_boundary_sequence():
             (5, 0.0, 0.0),  # Other event at index
             (5, 24.0, 0.0),  # Event exactly at input window boundary
             (5, 48.0, 0.0),  # Event exactly at gap window boundary
+            (5, 72.1, 0.0),  # Event exactly at gap window boundary
             (4, 72.1, 0.0),  # Death just after minimum time
             (5, 72.1, 0.0),  # Death just after minimum time
             (5, 72.2, 0.0),  # Random event after
@@ -459,6 +460,7 @@ def exact_boundary_sequence():
         "expected_statuses": [
             torch.tensor([0]),  # Initial state
             torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Gap window active
             torch.tensor([1]),  # Gap window active
             torch.tensor([1]),  # Waiting for next time token
             torch.tensor([1]),  # Waiting for next time token
@@ -538,12 +540,14 @@ def multiple_sequences():
             ((5, 5), (0.0, 0.0), (0.0, 0.0)),  # Other event at index
             ((5, 5), (20.0, 20.0), (0.0, 0.0)),  # Other event during input
             ((5, 1), (40.0, 40.0), (0.0, 0.0)),  # Other event during gap
+            ((5, 5), (72.0, 72.0), (0.0, 0.0)),  # Hospital discharge after gap
             ((3, 4), (72.0, 72.0), (0.0, 0.0)),  # Hospital discharge after gap
             ((5, 5), (73.0, 73.0), (0.0, 0.0)),  # Other event after discharge
         ],
         "expected_statuses": [
             torch.tensor([0, 0]),  # Initial state
             torch.tensor([1, 1]),  # Input window active
+            torch.tensor([1, 3]),  # Gap window active
             torch.tensor([1, 3]),  # Gap window active
             torch.tensor([1, 3]),  # Satisfied (discharge)
             torch.tensor([2, 3]),  # Remains satisfied
