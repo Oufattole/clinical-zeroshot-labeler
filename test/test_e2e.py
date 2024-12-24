@@ -19,27 +19,6 @@ from clinical_zeroshot_labeler.labeler import (
 )
 
 
-def print_window_tree(node, indent="", is_last=True):
-    """Print a WindowNode and its subtree in a hierarchical tree format.
-
-    Args:
-        node (WindowNode): The node to print
-        indent (str): The current indentation string
-        is_last (bool): Whether this node is the last child of its parent
-    """
-    # Print current node with proper indentation
-    branch = "└── " if is_last else "├── "
-    logger.info(f"{indent}{branch}{node.name}")
-
-    # Prepare indentation for children
-    child_indent = indent + ("    " if is_last else "│   ")
-
-    # Print all children
-    for i, child in enumerate(node.children):
-        is_last_child = i == len(node.children) - 1
-        print_window_tree(child, child_indent, is_last_child)
-
-
 def print_window_tree_with_state(node, batch_idx=0, indent="", is_last=True, time=None):
     """Print a WindowNode and its subtree including state information.
 
@@ -51,12 +30,12 @@ def print_window_tree_with_state(node, batch_idx=0, indent="", is_last=True, tim
     """
     # Get state information if available
     state_info = ""
-    if hasattr(node, "batch_states") and len(node.batch_states) > batch_idx:
-        state = node.batch_states[batch_idx]
+    if not node.ignore:
+        state = node.state
         state_info = (
-            f" [status={state.status}, "
-            f"start={state.start_time}, "
-            f"end={state.end_time}, "
+            f" [status={state.status.tolist()}, "
+            f"start={state.start_time.tolist()}, "
+            f"end={state.end_time.tolist()}, "
             f"counts={state.predicate_counts}] "
             f"label={node.label} ",
             f"index_timestamp={node.index_timestamp}",
@@ -133,6 +112,47 @@ def icu_morality_task_config_yaml():
       gap:
         start: input.end
         end: start + 48h
+        start_inclusive: False
+        end_inclusive: True
+        has:
+          icu_admission: (None, 0)
+          discharge_or_death: (None, 0)
+      target:
+        start: gap.end
+        end: start -> discharge_or_death
+        start_inclusive: False
+        end_inclusive: True
+        label: death
+    """
+
+
+@pytest.fixture
+def alternative_icu_morality_task_config_yaml():
+    return """
+    predicates:
+      hospital_discharge:
+        code: { regex: "^HOSPITAL_DISCHARGE//.*" }
+      icu_admission:
+        code: { regex: "^ICU_ADMISSION//.*" }
+      icu_discharge:
+        code: { regex: "^ICU_DISCHARGE//.*" }
+      death:
+        code: MEDS_DEATH
+      discharge_or_death:
+        expr: or(icu_discharge, death, hospital_discharge)
+
+    trigger: icu_admission
+
+    windows:
+      input:
+        start: null
+        end: trigger + 24h
+        start_inclusive: True
+        end_inclusive: True
+        index_timestamp: end
+      gap:
+        start: trigger  # Direct reference to trigger instead of input.end
+        end: start + 72h
         start_inclusive: False
         end_inclusive: True
         has:
@@ -319,7 +339,7 @@ def test_window_tree():
 
 
 @pytest.fixture
-def successful_death_sequence():
+def impossible_death_boundary_sequence():
     return {
         "sequence": [
             (5, 0.0, 0.0),  # Other event at index
@@ -340,12 +360,34 @@ def successful_death_sequence():
 
 
 @pytest.fixture
+def successful_death_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (4, 73.0, 0.0),  # Death after gap
+            (5, 74.0, 0.0),  # Other event after death
+        ],
+        "expected_statuses": [
+            torch.tensor([0]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Gap window active
+            torch.tensor([1]),  # Satisfied (death)
+            torch.tensor([2]),  # Remains satisfied
+        ],
+        "label": True,
+    }
+
+
+@pytest.fixture
 def successful_discharge_sequence():
     return {
         "sequence": [
             (5, 0.0, 0.0),  # Other event at index
             (5, 20.0, 0.0),  # Other event during input
             (5, 40.0, 0.0),  # Other event during gap
+            (5, 72.0, 0.0),  # Random Event after gap
             (3, 72.0, 0.0),  # Hospital discharge after gap
             (5, 73.0, 0.0),  # Other event after discharge
         ],
@@ -353,6 +395,7 @@ def successful_discharge_sequence():
             torch.tensor([0]),  # Initial state
             torch.tensor([1]),  # Input window active
             torch.tensor([1]),  # Gap window active
+            torch.tensor([1]),  # Random Event after gap
             torch.tensor([1]),  # Satisfied (discharge)
             torch.tensor([2]),  # Remains satisfied
         ],
@@ -564,7 +607,6 @@ def test_icu_mortality_sequences(icu_morality_task_config_yaml, metadata_df, seq
             status, expected_status
         ), f"{sequence_fixture_name} - Step {step}: Expected status {expected_status}, got {status}"
 
-        # import pdb; pdb.set_trace()
         prompts = torch.vstack([prompts, next_tokens])
     assert (
         torch.tensor(sequence_data["label"]) == (tree.root.get_labels() & (status == torch.tensor([2])))
@@ -862,3 +904,183 @@ def test_sequence_labeler_lab_values(
     assert sequence_data["label"] == any(
         labels
     ), f"{sequence_fixture_name} ({time_scale}): Expected label {sequence_data['label']}, got {labels}"
+
+
+def test_alternative_gap_window_reference_issue(metadata_df):
+    """Test handling of gap window with direct trigger reference."""
+    task_config_yaml = """
+    predicates:
+      hospital_discharge:
+        code: { regex: "^HOSPITAL_DISCHARGE//.*" }
+      icu_admission:
+        code: { regex: "^ICU_ADMISSION//.*" }
+      icu_discharge:
+        code: { regex: "^ICU_DISCHARGE//.*" }
+      death:
+        code: MEDS_DEATH
+      discharge_or_death:
+        expr: or(icu_discharge, death, hospital_discharge)
+
+    trigger: icu_admission
+
+    windows:
+      input:
+        start: null
+        end: trigger + 24h
+        start_inclusive: True
+        end_inclusive: True
+        index_timestamp: end
+      gap:
+        start: trigger  # Direct reference to trigger instead of input.end
+        end: start + 72h
+        start_inclusive: False
+        end_inclusive: True
+        has:
+          icu_admission: (None, 0)
+          discharge_or_death: (None, 0)
+      target:
+        start: gap.end
+        end: start -> discharge_or_death
+        start_inclusive: False
+        end_inclusive: True
+        label: death
+    """
+
+    # Setup test sequence that should trigger the issue
+    test_sequence = [
+        (5, 0.0, 0.0),  # Other event at index
+        (5, 20.0, 0.0),  # Other event during input
+        (5, 40.0, 0.0),  # Other event during gap
+        (4, 72.0, 0.0),  # Death after gap
+        (5, 74.0, 0.0),  # Other event after death
+    ]
+    expected_statuses = [
+        torch.tensor([1]),  # Initial state
+        torch.tensor([1]),  # Input window active
+        torch.tensor([1]),  # Gap window active
+        torch.tensor([1]),  # Satisfied (death)
+        torch.tensor([2]),  # Remains satisfied
+    ]
+    expected_label = True
+
+    # Create config from YAML and attempt to create labeler
+    labeler = SequenceLabeler.from_yaml_str(task_config_yaml, metadata_df, batch_size=1, time_scale="D")
+
+    # Set up model and test sequence
+    model = SimpleGenerativeModel([test_sequence])
+    prompts = torch.zeros((1), dtype=torch.long)
+
+    # Process each step
+    for step, expected_status in enumerate(expected_statuses):
+        next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
+        status = labeler.process_step(next_tokens, next_times, numeric_values)
+
+        assert torch.equal(
+            status, expected_status
+        ), f"Step {step}: Expected status {expected_status}, got {status}"
+
+        if not model.is_finished():
+            prompts = next_tokens
+
+    # Check final labels
+    labels = labeler.get_labels()
+    assert expected_label == any(labels), f"Expected label {expected_label}, got {labels}"
+
+
+@pytest.fixture
+def alt_successful_death_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (5, 73.0, 0.0),  # Other event after gap
+            (4, 73.0, 0.0),  # Death after gap
+            (5, 74.0, 0.0),  # Other event after death
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Gap window active
+            torch.tensor([1]),  # Gap window active
+            torch.tensor([1]),  # Satisfied (death)
+            torch.tensor([2]),  # Remains satisfied
+        ],
+        "label": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "sequence_fixture_name",
+    [
+        "alt_successful_death_sequence",
+        "successful_discharge_sequence",
+        "impossible_readmission_sequence",
+        "undetermined_sequence",
+        "exact_boundary_sequence",
+        "boundary_exclusion_sequence",
+        "death_before_discharge_same_time_sequence",
+        "multiple_sequences",
+    ],
+)
+def test_alternative_icu_mortality_sequences(
+    alternative_icu_morality_task_config_yaml, metadata_df, sequence_fixture_name, request
+):
+    """Test ICU mortality task with different sequence patterns."""
+    time_scale = "Y"
+    # Get sequence data from fixture
+    sequence_data = request.getfixturevalue(sequence_fixture_name)
+    sequence = sequence_data["sequence"]
+    expected_statuses = sequence_data["expected_statuses"]
+    batch_size = 1 if isinstance(sequence[0][0], int) else len(sequence[0][0])
+
+    # Convert sequence times to the target scale
+    conversion_factor = (
+        1 / 365 / 24 if time_scale == "Y" else 1 / 24
+    )  # Convert hours to years for Y scale or days for D
+    if isinstance(sequence[0][0], int):
+        # Single sequence case
+        sequence = [(t, time * conversion_factor, v) for t, time, v in sequence]
+    else:
+        # Multiple sequence case (tuple of sequences)
+        sequence = [
+            (tuple(t), tuple(time * conversion_factor for time in times), tuple(v))
+            for t, times, v in sequence
+        ]
+
+    # Create labeler with time scale
+    labeler = SequenceLabeler.from_yaml_str(
+        alternative_icu_morality_task_config_yaml, metadata_df, batch_size=batch_size, time_scale=time_scale
+    )
+
+    # Set up model
+    model = SimpleGenerativeModel([sequence])
+    prompts = torch.zeros((batch_size), dtype=torch.long)
+
+    # Process each step
+    for step, expected_status in enumerate(expected_statuses):
+        next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
+        status = labeler.process_step(next_tokens, next_times, numeric_values).clone()
+        # TODO: We currently don't check whether it correctly tracks being in WindowStatus 0 or 1
+        status[status == 0] += 1
+        expected_status[expected_status == 0] += 1
+
+        assert torch.equal(status, expected_status), (
+            f"{sequence_fixture_name} ({time_scale}) - Step {step}: "
+            f"Expected status {expected_status}, got {status}"
+        )
+
+        if not model.is_finished():
+            prompts = next_tokens
+
+    # Check final labels
+    labels = labeler.get_labels()
+    expected_labels = (
+        torch.tensor(sequence_data["label"])
+        if isinstance(sequence_data["label"], list)
+        else torch.tensor([sequence_data["label"]])
+    )
+
+    assert torch.equal(
+        labels & (status == torch.tensor(2)), expected_labels
+    ), f"{sequence_fixture_name} ({time_scale}): Expected labels {expected_labels}, got {labels}"

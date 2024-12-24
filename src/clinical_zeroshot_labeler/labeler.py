@@ -974,14 +974,19 @@ def convert_task_config(
 
         # Create window node with converted bounds
         if start_bound is None:
-            parent_window_name, start_or_end = window.start.split(".")
-            if start_or_end == "start":
-                start_bound = all_nodes[parent_window_name].start_bound
-            elif start_or_end == "end":
-                start_bound = all_nodes[parent_window_name].end_bound
+            if window.start == "trigger":
+                start_bound = all_nodes["trigger"].start_bound
+            else:
+                parent_window_name, start_or_end = window.start.split(".")
+                if start_or_end == "start":
+                    start_bound = all_nodes[parent_window_name].start_bound
+                elif start_or_end == "end":
+                    start_bound = all_nodes[parent_window_name].end_bound
+
+        # Handle end bound similarly
         if end_bound is None:
             if window.end == "trigger":
-                end_bound = root.end_bound
+                end_bound = all_nodes["trigger"].end_bound
             else:
                 parent_window_name, start_or_end = window.end.split(".")
                 if start_or_end == "start":
