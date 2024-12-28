@@ -4,11 +4,12 @@ import pytest
 import torch
 from loguru import logger
 from omegaconf import DictConfig
-from test_e2e import (  # noqa
+from test_labeler import (  # noqa
     abnormal_lab_task_config_yaml,
     alt_successful_death_sequence,
     alternative_icu_morality_task_config_yaml,
     boundary_exclusion_sequence,
+    convert_sequence_times,
     death_after_discharge_same_time_sequence,
     death_before_discharge_same_time_sequence,
     exact_boundary_sequence,
@@ -21,7 +22,7 @@ from test_e2e import (  # noqa
     impossible_death_boundary_sequence,
     impossible_readmission_sequence,
     metadata_df,
-    multiple_sequences,
+    print_window_tree_with_state,
     successful_death_sequence,
     successful_discharge_sequence,
     undetermined_sequence,
@@ -188,12 +189,12 @@ def abnormal_sequence():
     }
 
 
-def test_single_sequence_generation(normal_sequence):
+def test_single_sequence_generation(normal_sequence, metadata_df):  # noqa: F811
     """Test generation with a single predefined sequence."""
     sequence_data = normal_sequence["sequence"]
     expected_statuses = normal_sequence["expected_statuses"]
 
-    model = MockGenerativeModel(sequences=[sequence_data])
+    model = MockGenerativeModel(metadata_df, sequences=[sequence_data])
     prompts = torch.tensor([[1]])  # Single token prompt
     mask = torch.ones_like(prompts, dtype=torch.bool)
 
@@ -223,12 +224,12 @@ def test_single_sequence_generation(normal_sequence):
     assert torch.all(tokens[:, : len(expected_tokens)] == expected_tokens)
 
 
-def test_batch_sequence_generation(normal_sequence, abnormal_sequence):
+def test_batch_sequence_generation(normal_sequence, abnormal_sequence, metadata_df):  # noqa: F811
     """Test generation with multiple sequences in a batch."""
     sequences = [normal_sequence["sequence"], abnormal_sequence["sequence"]]
     expected_statuses = [normal_sequence["expected_statuses"], abnormal_sequence["expected_statuses"]]
 
-    model = MockGenerativeModel(sequences=sequences)
+    model = MockGenerativeModel(metadata_df, sequences=sequences)
     prompts = torch.tensor([[1], [1]])  # Two single-token prompts
     mask = torch.ones_like(prompts, dtype=torch.bool)
 
@@ -261,11 +262,11 @@ def test_batch_sequence_generation(normal_sequence, abnormal_sequence):
     assert torch.equal(meta["labels"], torch.tensor([False, True]))
 
 
-def test_sequence_completion_with_max_tokens(normal_sequence):
+def test_sequence_completion_with_max_tokens(normal_sequence, metadata_df):  # noqa: F811
     """Test sequence completion respects max tokens budget."""
     # Set max_tokens less than sequence length
     max_tokens = 2
-    model = MockGenerativeModel(sequences=[normal_sequence["sequence"]], max_tokens=max_tokens)
+    model = MockGenerativeModel(metadata_df, sequences=[normal_sequence["sequence"]], max_tokens=max_tokens)
     prompts = torch.tensor([[1]])
     mask = torch.ones_like(prompts, dtype=torch.bool)
 
@@ -275,9 +276,9 @@ def test_sequence_completion_with_max_tokens(normal_sequence):
     assert lengths[0] == max_tokens
 
 
-def test_temperature_sampling(normal_sequence):
+def test_temperature_sampling(normal_sequence, metadata_df):  # noqa: F811
     """Test that temperature affects sampling behavior."""
-    model = MockGenerativeModel(sequences=[normal_sequence["sequence"]])
+    model = MockGenerativeModel(metadata_df, sequences=[normal_sequence["sequence"]])
     prompts = torch.tensor([[1]])
     mask = torch.ones_like(prompts, dtype=torch.bool)
 
@@ -298,10 +299,12 @@ class MockGenerativeModel(BaseGenerativeModel):
 
     def __init__(
         self,
+        metadata_df,  # noqa: F811
         sequences=None,
         max_tokens=50,
         vocab_size=100,
     ):
+        self.metadata_df = metadata_df
         self.model = SimpleNamespace()
         self.model.model = MockTransformerWrapper(
             num_tokens=vocab_size,
@@ -337,6 +340,17 @@ class MockGenerativeModel(BaseGenerativeModel):
             values = torch.tensor(values, device=tokens.device)
 
             status = trajectory_labeler.process_step(tokens[:, -1], times, values)
+            index_to_name = {
+                k: v for k, v in zip(self.metadata_df["code/vocab_index"], self.metadata_df["code"])
+            }
+            token = tokens[:, -1][0]
+            token_name = index_to_name[token.item()]
+            logger.info(
+                f"token_name: {token_name}, token: {token}, times: {times}, "
+                f"values: {values}, status: {status}"
+            )
+            if hasattr(trajectory_labeler, "tree"):
+                print_window_tree_with_state(trajectory_labeler.tree.root)
 
             sequences_complete = status == WindowStatus.SATISFIED.value
 
@@ -353,24 +367,6 @@ class MockGenerativeModel(BaseGenerativeModel):
                 0
             ) < prompt_lens.unsqueeze(1)
         return torch.equal(right_pad_mask, mask)
-
-
-def convert_sequence_times(sequence, time_scale):
-    """Convert sequence times to the specified scale."""
-    conversion_factor = 1 / 365 if time_scale == "Y" else 1
-
-    if isinstance(sequence[0][0], tuple):  # Multiple sequences
-        result = []
-        for seq_tuple in sequence:
-            tokens, times, values = seq_tuple
-            if isinstance(tokens, tuple):
-                # Handle batch sequences
-                result.append(list(zip(tokens, [t * conversion_factor for t in times], values)))
-            else:
-                result.append((tokens, times * conversion_factor, values))
-        return result
-    else:  # Single sequence
-        return [(t, time * conversion_factor, v) for t, time, v in sequence]
 
 
 @pytest.mark.parametrize(
@@ -413,13 +409,13 @@ def test_sequence_generation(
     expected_label = sequence_data["label"]
 
     # Create labeler
-    batch_size = len(expected_statuses[0])
+    batch_size = len(sequence)
     labeler = SequenceLabeler.from_yaml_str(
         config_yaml, metadata_df, batch_size=batch_size, time_scale=time_scale
     )
 
     # Create model with sequence
-    model = MockGenerativeModel(sequences=[sequence])
+    model = MockGenerativeModel(metadata_df, sequences=sequence)
     prompts = torch.zeros((batch_size,), dtype=torch.long)
     mask = torch.ones_like(prompts, dtype=torch.bool)
 
