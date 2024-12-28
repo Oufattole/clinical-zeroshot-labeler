@@ -1088,3 +1088,162 @@ def test_alternative_icu_mortality_sequences(
     assert torch.equal(
         labels & (status == torch.tensor(2)), expected_labels
     ), f"{sequence_fixture_name} ({time_scale}): Expected labels {expected_labels}, got {labels}"
+
+
+@pytest.fixture
+def hematocrit_task_config_yaml():
+    return """
+    predicates:
+      trigger_event:
+        code: { regex: "^HOSPITAL_DISCHARGE//.*" }
+      lab:
+        code: { regex: "^LAB//.*" }
+      lab_1:
+        code: "LAB//1"
+        value_max: 24
+        value_max_inclusive: True
+      lab_2:
+        code: "LAB//2"
+        value_max: 24
+        value_max_inclusive: True
+      abnormal_lab:
+        expr: or(lab_1,lab_2)
+
+    trigger: trigger_event
+
+    windows:
+      input:
+        start: NULL
+        end: trigger
+        start_inclusive: True
+        end_inclusive: True
+        index_timestamp: end
+      target:
+        start: input.end
+        end: start + 30d
+        start_inclusive: False
+        end_inclusive: True
+        has:
+          lab: (1, None)
+        label: abnormal_lab
+    """
+
+
+@pytest.fixture
+def hematocrit_normal_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 15.0, 25.0),  # Normal lab (value > 24)
+            (7, 20.0, 30.0),  # Another normal lab
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Still active (no abnormal labs)
+            torch.tensor([1]),  # Still active (no abnormal labs)
+        ],
+        "label": False,  # No abnormal labs found
+    }
+
+
+@pytest.fixture
+def hematocrit_abnormal_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 15.0, 23.0),  # Abnormal lab (value <= 24)
+            (7, 20.0, 25.0),  # Normal lab after
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([2]),  # Satisfied (abnormal lab found)
+            torch.tensor([2]),  # Remains satisfied
+        ],
+        "label": True,  # Abnormal lab found
+    }
+
+
+@pytest.fixture
+def hematocrit_boundary_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 30.0, 23.0),  # Lab at exactly 30 days (inclusive)
+            (7, 31.0, 22.0),  # Lab after window (should be ignored)
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([2]),  # Satisfied (abnormal lab within window)
+            torch.tensor([2]),  # Remains satisfied
+        ],
+        "label": True,  # Abnormal lab found within window
+    }
+
+
+@pytest.fixture
+def hematocrit_threshold_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 15.0, 24.0),  # Lab exactly at threshold (inclusive)
+            (7, 20.0, 24.1),  # Lab just above threshold
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([2]),  # Satisfied (at threshold, inclusive)
+            torch.tensor([2]),  # Remains satisfied
+        ],
+        "label": True,  # Abnormal lab at threshold
+    }
+
+
+@pytest.mark.parametrize(
+    "sequence_fixture_name",
+    [
+        "hematocrit_normal_sequence",
+        "hematocrit_abnormal_sequence",
+        "hematocrit_boundary_sequence",
+        "hematocrit_threshold_sequence",
+    ],
+)
+def test_sequence_labeler_hematocrit(
+    hematocrit_task_config_yaml, metadata_df, sequence_fixture_name, request
+):
+    """Test SequenceLabeler with various hematocrit lab sequences."""
+    time_scale = "Y"
+    # Get sequence data from fixture
+    sequence_data = request.getfixturevalue(sequence_fixture_name)
+    sequence = sequence_data["sequence"]
+    expected_statuses = sequence_data["expected_statuses"]
+
+    # Convert sequence times to the target scale
+    conversion_factor = 1 / 365 if time_scale == "Y" else 1  # Convert days to years for Y scale
+    sequence = [(t, time * conversion_factor, v) for t, time, v in sequence]
+
+    # Create labeler with time scale
+    labeler = SequenceLabeler.from_yaml_str(
+        hematocrit_task_config_yaml, metadata_df, batch_size=1, time_scale=time_scale
+    )
+
+    # Set up model
+    model = SimpleGenerativeModel([sequence])
+    prompts = torch.zeros((1), dtype=torch.long)
+
+    # Test each step
+    for step, expected_status in enumerate(expected_statuses):
+        next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
+        status = labeler.process_step(next_tokens, next_times, numeric_values)
+
+        assert torch.equal(status, expected_status), (
+            f"{sequence_fixture_name} ({time_scale}) - Step {step}: "
+            f"Expected status {expected_status}, got {status}"
+        )
+
+        if not model.is_finished():
+            prompts = next_tokens
+
+    # Check final labels
+    labels = labeler.get_labels()
+    assert sequence_data["label"] == any(labels), (
+        f"{sequence_fixture_name} ({time_scale}): " f"Expected label {sequence_data['label']}, got {labels}"
+    )
