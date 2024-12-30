@@ -659,6 +659,91 @@ def successful_abnormal_lab():
             (5, 40.0, 0.0),  # Other event during gap
             (6, 72.0, 100.0),  # Lab event
             (7, 73.0, 100.0),  # Other lab event
+            (5, 100.0, 0.0),  # Other event after 4 days
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Other event
+            torch.tensor([1]),  # Satisfied
+            torch.tensor([1]),  # Remains satisfied
+            torch.tensor([2]),  # Window ends
+        ],
+        "label": True,
+    }
+
+
+@pytest.fixture
+def successful_second_abnormal_lab():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (6, 72.0, 0.0),  # Normal Lab event
+            (7, 73.0, 100.0),  # Abnormal lab event
+            (5, 100.0, 0.0),  # Other event after 4 days
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Other event
+            torch.tensor([1]),  # Active
+            torch.tensor([1]),  # Active
+            torch.tensor([2]),  # Remains satisfied
+        ],
+        "label": True,
+    }
+
+
+@pytest.fixture
+def normal_lab_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (6, 72.0, 1.5),  # Lab event with normal value (between -2 and 2)
+            (7, 73.0, -1.8),  # Another normal lab
+            (5, 100.0, 0.0),  # Other event after 4 days
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Input window active
+            torch.tensor([1]),  # Still active (no abnormal labs)
+            torch.tensor([1]),  # Still active (no abnormal labs)
+        ],
+        "label": False,  # No abnormal labs found
+    }
+
+
+@pytest.fixture
+def edge_case_lab_sequence():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (7, 73.0, -2.0),  # Lab exactly at low threshold (exclusive)
+            (6, 72.0, 2.0),  # Lab exactly at high threshold (inclusive)
+            (5, 100.0, 0.0),  # Other event after 4 days
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Still active
+            torch.tensor([1]),  # Satisfied but waiting until out of window
+            torch.tensor([2]),  # Satisfied
+        ],
+        "label": True,  # Abnormal lab found (high threshold inclusive)
+    }
+
+
+@pytest.fixture
+def early_stop_successful_abnormal_lab():
+    return {
+        "sequence": [
+            (5, 0.0, 0.0),  # Other event at index
+            (5, 20.0, 0.0),  # Other event during input
+            (5, 40.0, 0.0),  # Other event during gap
+            (6, 72.0, 100.0),  # Lab event
+            (7, 73.0, 100.0),  # Other lab event
         ],
         "expected_statuses": [
             torch.tensor([1]),  # Initial state
@@ -672,7 +757,7 @@ def successful_abnormal_lab():
 
 
 @pytest.fixture
-def successful_second_abnormal_lab():
+def early_stop_successful_second_abnormal_lab():
     return {
         "sequence": [
             (5, 0.0, 0.0),  # Other event at index
@@ -693,7 +778,7 @@ def successful_second_abnormal_lab():
 
 
 @pytest.fixture
-def normal_lab_sequence():
+def early_stop_normal_lab_sequence():
     return {
         "sequence": [
             (5, 0.0, 0.0),  # Other event at index
@@ -712,7 +797,7 @@ def normal_lab_sequence():
 
 
 @pytest.fixture
-def edge_case_lab_sequence():
+def early_stop_edge_case_lab_sequence():
     return {
         "sequence": [
             (5, 0.0, 0.0),  # Other event at index
@@ -791,7 +876,7 @@ def hematocrit_task_config_yaml():
 
 
 @pytest.fixture
-def hematocrit_normal_sequence():
+def early_stop_hematocrit_normal_sequence():
     return {
         "sequence": [
             (3, 0.0, 0.0),  # Hospital discharge at index
@@ -808,7 +893,7 @@ def hematocrit_normal_sequence():
 
 
 @pytest.fixture
-def hematocrit_abnormal_sequence():
+def early_stop_hematocrit_abnormal_sequence():
     return {
         "sequence": [
             (3, 0.0, 0.0),  # Hospital discharge at index
@@ -825,7 +910,7 @@ def hematocrit_abnormal_sequence():
 
 
 @pytest.fixture
-def hematocrit_boundary_sequence():
+def early_stop_hematocrit_boundary_sequence():
     return {
         "sequence": [
             (3, 0.0, 0.0),  # Hospital discharge at index
@@ -842,7 +927,7 @@ def hematocrit_boundary_sequence():
 
 
 @pytest.fixture
-def hematocrit_threshold_sequence():
+def early_stop_hematocrit_threshold_sequence():
     return {
         "sequence": [
             (3, 0.0, 0.0),  # Hospital discharge at index
@@ -858,37 +943,119 @@ def hematocrit_threshold_sequence():
     }
 
 
+@pytest.fixture
+def hematocrit_normal_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 15.0, 25.0),  # Normal lab (value > 24)
+            (7, 20.0, 30.0),  # Another normal lab
+            (5, 721.0, 30.0),  # Another normal lab
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Still active (no abnormal labs)
+            torch.tensor([1]),  # Still active (no abnormal labs)
+            torch.tensor([2]),  # Satsified as window ended
+        ],
+        "label": False,  # No abnormal labs found
+    }
+
+
+@pytest.fixture
+def hematocrit_abnormal_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 15.0, 23.0),  # Abnormal lab (value <= 24)
+            (7, 20.0, 25.0),  # Normal lab after
+            (5, 721.0, 25.0),  # Outside window
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # Still in window
+            torch.tensor([1]),  # Still in window
+            torch.tensor([2]),  # Satisfied (window ended)
+        ],
+        "label": True,  # Abnormal lab found
+    }
+
+
+@pytest.fixture
+def hematocrit_boundary_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 30.0, 23.0),  # Lab at exactly 30 days (inclusive)
+            (7, 721.0, 22.0),  # Lab after window (should be ignored)
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # still in window, so unsatisfied
+            torch.tensor([2]),  # Satisfied, observation after window
+        ],
+        "label": True,  # Abnormal lab found within window
+    }
+
+
+@pytest.fixture
+def hematocrit_threshold_sequence():
+    return {
+        "sequence": [
+            (3, 0.0, 0.0),  # Hospital discharge at index
+            (6, 15.0, 24.0),  # Lab exactly at threshold (inclusive)
+            (7, 20.0, 24.1),  # Lab just above threshold
+            (5, 721, 24.1),  # Event after window
+        ],
+        "expected_statuses": [
+            torch.tensor([1]),  # Initial state
+            torch.tensor([1]),  # In window, not satisfied
+            torch.tensor([1]),  # In window, not satisfied
+            torch.tensor([2]),  # Window Ended, becomes satisfied
+        ],
+        "label": True,  # Abnormal lab at threshold
+    }
+
+
 @pytest.mark.parametrize(
-    ["sequence_fixture_name", "task_yaml_name"],
+    ["sequence_fixture_name", "task_yaml_name", "early_stop"],
     [
-        ("successful_death_sequence", "icu_morality_task_config_yaml"),
-        ("successful_discharge_sequence", "icu_morality_task_config_yaml"),
-        ("impossible_readmission_sequence", "icu_morality_task_config_yaml"),
-        ("undetermined_sequence", "icu_morality_task_config_yaml"),
-        ("exact_boundary_sequence", "icu_morality_task_config_yaml"),
-        ("boundary_exclusion_sequence", "icu_morality_task_config_yaml"),
-        ("death_after_discharge_same_time_sequence", "icu_morality_task_config_yaml"),
-        ("death_before_discharge_same_time_sequence", "icu_morality_task_config_yaml"),
-        ("multiple_sequences_death", "icu_morality_task_config_yaml"),
-        ("successful_abnormal_lab", "abnormal_lab_task_config_yaml"),
-        ("successful_second_abnormal_lab", "abnormal_lab_task_config_yaml"),
-        ("normal_lab_sequence", "abnormal_lab_task_config_yaml"),
-        ("edge_case_lab_sequence", "abnormal_lab_task_config_yaml"),
-        ("alt_successful_death_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("successful_discharge_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("impossible_readmission_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("undetermined_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("exact_boundary_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("boundary_exclusion_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("death_before_discharge_same_time_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("multiple_sequences_death", "alternative_icu_morality_task_config_yaml"),
-        ("hematocrit_normal_sequence", "hematocrit_task_config_yaml"),
-        ("hematocrit_abnormal_sequence", "hematocrit_task_config_yaml"),
-        ("hematocrit_boundary_sequence", "hematocrit_task_config_yaml"),
-        ("hematocrit_threshold_sequence", "hematocrit_task_config_yaml"),
+        ("successful_death_sequence", "icu_morality_task_config_yaml", False),
+        ("successful_discharge_sequence", "icu_morality_task_config_yaml", False),
+        ("impossible_readmission_sequence", "icu_morality_task_config_yaml", False),
+        ("undetermined_sequence", "icu_morality_task_config_yaml", False),
+        ("exact_boundary_sequence", "icu_morality_task_config_yaml", False),
+        ("boundary_exclusion_sequence", "icu_morality_task_config_yaml", False),
+        ("death_after_discharge_same_time_sequence", "icu_morality_task_config_yaml", False),
+        ("death_before_discharge_same_time_sequence", "icu_morality_task_config_yaml", False),
+        ("multiple_sequences_death", "icu_morality_task_config_yaml", False),
+        ("successful_abnormal_lab", "abnormal_lab_task_config_yaml", False),
+        ("successful_second_abnormal_lab", "abnormal_lab_task_config_yaml", False),
+        ("normal_lab_sequence", "abnormal_lab_task_config_yaml", False),
+        ("edge_case_lab_sequence", "abnormal_lab_task_config_yaml", False),
+        ("early_stop_successful_abnormal_lab", "abnormal_lab_task_config_yaml", True),
+        ("early_stop_successful_second_abnormal_lab", "abnormal_lab_task_config_yaml", True),
+        ("early_stop_normal_lab_sequence", "abnormal_lab_task_config_yaml", True),
+        ("early_stop_edge_case_lab_sequence", "abnormal_lab_task_config_yaml", True),
+        ("alt_successful_death_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("successful_discharge_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("impossible_readmission_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("undetermined_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("exact_boundary_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("boundary_exclusion_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("death_before_discharge_same_time_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("multiple_sequences_death", "alternative_icu_morality_task_config_yaml", False),
+        ("early_stop_hematocrit_normal_sequence", "hematocrit_task_config_yaml", True),
+        ("early_stop_hematocrit_abnormal_sequence", "hematocrit_task_config_yaml", True),
+        ("early_stop_hematocrit_boundary_sequence", "hematocrit_task_config_yaml", True),
+        ("early_stop_hematocrit_threshold_sequence", "hematocrit_task_config_yaml", True),
+        ("hematocrit_normal_sequence", "hematocrit_task_config_yaml", False),
+        ("hematocrit_abnormal_sequence", "hematocrit_task_config_yaml", False),
+        ("hematocrit_boundary_sequence", "hematocrit_task_config_yaml", False),
+        ("hematocrit_threshold_sequence", "hematocrit_task_config_yaml", False),
     ],
 )
-def test_sequence_labeler(metadata_df, sequence_fixture_name, task_yaml_name, request):
+def test_sequence_labeler(metadata_df, sequence_fixture_name, task_yaml_name, early_stop, request):
     """Test ICU mortality task with different sequence patterns."""
     # Get sequence data from fixture
     time_scale = "Y"
@@ -903,7 +1070,11 @@ def test_sequence_labeler(metadata_df, sequence_fixture_name, task_yaml_name, re
 
     # Create labeler with time scale
     labeler = SequenceLabeler.from_yaml_str(
-        task_config_yaml, metadata_df, batch_size=batch_size, time_scale=time_scale
+        task_config_yaml,
+        metadata_df,
+        batch_size=batch_size,
+        time_scale=time_scale,
+        early_stop=early_stop,
     )
     gap_years = labeler.gap_days / 365
 
@@ -916,7 +1087,8 @@ def test_sequence_labeler(metadata_df, sequence_fixture_name, task_yaml_name, re
     for step, expected_status in enumerate(expected_statuses):
         next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
         status = labeler.process_step(next_tokens, next_times - gap_years, numeric_values).clone()
-        # TODO: We currently don't check whether it correctly tracks being in WindowStatus 0 or 1
+        # TODO: We currently don't test whether the labeler correctly differentiate between states
+        #       WindowStatus 0 or 1
         print_window_tree_with_state(labeler.tree.root)
         status[status == 0] = 1
         expected_status[expected_status == 0] = 1

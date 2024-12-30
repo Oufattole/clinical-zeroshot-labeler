@@ -12,6 +12,10 @@ from test_labeler import (  # noqa
     convert_sequence_times,
     death_after_discharge_same_time_sequence,
     death_before_discharge_same_time_sequence,
+    early_stop_hematocrit_abnormal_sequence,
+    early_stop_hematocrit_boundary_sequence,
+    early_stop_hematocrit_normal_sequence,
+    early_stop_hematocrit_threshold_sequence,
     exact_boundary_sequence,
     hematocrit_abnormal_sequence,
     hematocrit_boundary_sequence,
@@ -446,24 +450,28 @@ def multiple_icu_mortality(
     ],
 )
 @pytest.mark.parametrize(
-    "sequence_fixture,config_fixture,prune_terminated",
+    "sequence_fixture,config_fixture,prune_terminated,early_stop",
     [
-        ("successful_death_sequence", "icu_morality_task_config_yaml", False),
-        ("successful_discharge_sequence", "icu_morality_task_config_yaml", False),
-        ("impossible_readmission_sequence", "icu_morality_task_config_yaml", False),
-        ("undetermined_sequence", "icu_morality_task_config_yaml", False),
-        ("exact_boundary_sequence", "icu_morality_task_config_yaml", False),
-        ("boundary_exclusion_sequence", "icu_morality_task_config_yaml", False),
-        ("death_after_discharge_same_time_sequence", "icu_morality_task_config_yaml", False),
-        ("death_before_discharge_same_time_sequence", "icu_morality_task_config_yaml", False),
-        ("impossible_death_boundary_sequence", "icu_morality_task_config_yaml", False),
-        ("alt_successful_death_sequence", "alternative_icu_morality_task_config_yaml", False),
-        ("hematocrit_normal_sequence", "hematocrit_task_config_yaml", False),
-        ("hematocrit_abnormal_sequence", "hematocrit_task_config_yaml", False),
-        ("hematocrit_boundary_sequence", "hematocrit_task_config_yaml", False),
-        ("hematocrit_threshold_sequence", "hematocrit_task_config_yaml", False),
-        ("multiple_icu_mortality", "icu_morality_task_config_yaml", False),
-        ("multiple_icu_mortality", "icu_morality_task_config_yaml", True),
+        ("successful_death_sequence", "icu_morality_task_config_yaml", False, False),
+        ("successful_discharge_sequence", "icu_morality_task_config_yaml", False, False),
+        ("impossible_readmission_sequence", "icu_morality_task_config_yaml", False, False),
+        ("undetermined_sequence", "icu_morality_task_config_yaml", False, False),
+        ("exact_boundary_sequence", "icu_morality_task_config_yaml", False, False),
+        ("boundary_exclusion_sequence", "icu_morality_task_config_yaml", False, False),
+        ("death_after_discharge_same_time_sequence", "icu_morality_task_config_yaml", False, False),
+        ("death_before_discharge_same_time_sequence", "icu_morality_task_config_yaml", False, False),
+        ("impossible_death_boundary_sequence", "icu_morality_task_config_yaml", False, False),
+        ("alt_successful_death_sequence", "alternative_icu_morality_task_config_yaml", False, False),
+        ("early_stop_hematocrit_normal_sequence", "hematocrit_task_config_yaml", False, True),
+        ("early_stop_hematocrit_abnormal_sequence", "hematocrit_task_config_yaml", False, True),
+        ("early_stop_hematocrit_boundary_sequence", "hematocrit_task_config_yaml", False, True),
+        ("early_stop_hematocrit_threshold_sequence", "hematocrit_task_config_yaml", False, True),
+        ("hematocrit_normal_sequence", "hematocrit_task_config_yaml", False, False),
+        ("hematocrit_abnormal_sequence", "hematocrit_task_config_yaml", False, False),
+        ("hematocrit_boundary_sequence", "hematocrit_task_config_yaml", False, False),
+        ("hematocrit_threshold_sequence", "hematocrit_task_config_yaml", False, False),
+        ("multiple_icu_mortality", "icu_morality_task_config_yaml", False, False),
+        ("multiple_icu_mortality", "icu_morality_task_config_yaml", True, False),
     ],
 )
 def test_sequence_generation(
@@ -473,6 +481,7 @@ def test_sequence_generation(
     config_fixture,
     metadata_df,  # noqa: F811
     prune_terminated,
+    early_stop,
 ):
     """Test sequence generation against all fixtures."""
     # Get sequence data and config
@@ -487,7 +496,11 @@ def test_sequence_generation(
     # Create labeler
     batch_size = len(sequence)
     labeler = SequenceLabeler.from_yaml_str(
-        config_yaml, metadata_df, batch_size=batch_size, time_scale=time_scale
+        config_yaml,
+        metadata_df,
+        batch_size=batch_size,
+        time_scale=time_scale,
+        early_stop=early_stop,
     )
 
     # Create model with sequence

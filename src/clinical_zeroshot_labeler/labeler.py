@@ -623,6 +623,66 @@ class WindowNode:
     >>> step_4_status # Now both sequences are SATISFIED
     tensor([2, 2])
 
+
+    If we enable early stopping for temporal windows, we can stop sequences that are still in the window
+    as soon as a positive label is observed
+
+    >>> # Create a single WindowNode that requires the predicate "some_pred" at least once.
+    >>> # We'll define "some_pred" as a PredicateTensor matching token == 3.
+    >>> node = WindowNode(
+    ...     name="my_window",
+    ...     start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
+    ...     end_bound=TemporalBound(reference="trigger + 30h", inclusive=True, offset=timedelta(hours=30)),
+    ...     predicate_constraints={},  # Must see at least 1 occurrence of "some_pred"
+    ...     label="some_pred",
+    ...     index_timestamp=None,
+    ...     tensorized_predicates={
+    ...         "some_pred": PredicateTensor(
+    ...             name="some_pred",
+    ...             tokens=torch.tensor([3], dtype=torch.long),  # Token 3 triggers "some_pred"
+    ...             value_limits=(None, None),
+    ...             value_inclusions=(None, None),
+    ...             children=[],
+    ...             is_and=False,
+    ...         )
+    ...     },
+    ...     early_stop=True,
+    ... )
+
+    >>> # Initialize batch_size=2 for two parallel sequences.
+    >>> node.initialize_batch(batch_size=2)
+
+    >>> # Step 1: Sequence 0 sees token=3 (it early stops within the temporal window as the label is known),
+    >>> #         Sequence 1 sees token=5 (no effect).
+    >>> step_1_status = node.update(
+    ...     time_deltas=torch.tensor([0.0, 0.0]),
+    ...     event_tokens=torch.tensor([3, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_1_status #
+    tensor([2, 1])
+
+    >>> # Step 2: We must still pass tokens for Sequence 0, even though it's satisfied.
+    >>> #         Both sequences see token=5 here => no new progress for Sequence 1.
+    >>> step_2_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 1.0]),
+    ...     event_tokens=torch.tensor([5, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_2_status # Sequence 0 stays SATISFIED, Sequence 1 remains ACTIVE
+    tensor([2, 1])
+
+    >>> # Step 3: Finally, Sequence 1 sees token=3 => so it should become satisfied
+    >>> #         after passing the time window.
+    >>> step_3_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 1.0]),
+    ...     event_tokens=torch.tensor([5, 3]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_3_status # Now both sequences are SATISFIED
+    tensor([2, 2])
+
+
     Test event-based end bounds and continued tracking after satisfaction:
 
     >>> # Create a window that ends on a specific event (token=4)
@@ -710,6 +770,7 @@ class WindowNode:
     state: WindowState | None = None
     ignore: bool = False
     label_value: bool | None = None
+    early_stop: bool = False
 
     def get_labels(self):
         if self.label is not None:
@@ -806,7 +867,8 @@ class WindowNode:
 
         # For other windows, need to wait for window end
         if isinstance(self.end_bound, TemporalBound):
-            # TODO: Consider enabling early stopping for temporal windows when the label becomes true
+            if self.early_stop and self.label_value is not None:
+                return satisfied & (self.label_value | ~torch.isnan(self.state.end_time))
             return satisfied & ~torch.isnan(self.state.end_time)
         else:
             if isinstance(self.end_bound.predicate, str):
@@ -889,8 +951,6 @@ class WindowNode:
             # Check constraints
             impossible = self._check_constraints_impossible()
             satisfied = self._check_constraints_satisfied()
-            if self.label_value is not None:
-                satisfied = satisfied | self.label_value
 
             # Update status based on constraints
             self.state.status = torch.where(
@@ -1118,7 +1178,7 @@ def calculate_index_timestamp_info(tree: AutoregressiveWindowTree) -> tuple[floa
 
 
 def convert_task_config(
-    config: TaskExtractorConfig, batch_size: int, metadata_df: pl.DataFrame
+    config: TaskExtractorConfig, batch_size: int, metadata_df: pl.DataFrame, early_stop: bool = False
 ) -> AutoregressiveWindowTree:
     """Convert TaskExtractorConfig to AutoregressiveWindowTree.
 
@@ -1144,6 +1204,7 @@ def convert_task_config(
         label=None,
         index_timestamp=None,
         tensorized_predicates=tensorized_predicates,
+        early_stop=early_stop,
     )
 
     def convert_endpoint_expr(
@@ -1218,6 +1279,7 @@ def convert_task_config(
             label=window.label,
             index_timestamp=window.index_timestamp,
             tensorized_predicates=tensorized_predicates,
+            early_stop=early_stop,
         )
         all_nodes[window_name] = node
 
@@ -1248,12 +1310,14 @@ class SequenceLabeler:
         gap_days (float): temporal gap in days between index timestamp and trigger
         batch_size (int)
         time_scale (TimeScale)
+        early_stop (bool): whether to early stop within a temporal window if a label is found
     """
 
     tree: AutoregressiveWindowTree
     gap_days: float
     batch_size: int
     time_scale: TimeScale = "D"  # Default to days
+    early_stop: bool = False
     _finished: bool = False
 
     def _convert_to_days(self, times: torch.Tensor) -> torch.Tensor:
@@ -1277,22 +1341,32 @@ class SequenceLabeler:
 
     @classmethod
     def from_yaml_str(
-        cls, yaml_str: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+        cls,
+        yaml_str: str,
+        metadata_df: pl.DataFrame,
+        batch_size: int,
+        time_scale: TimeScale = "D",
+        early_stop: bool = False,
     ) -> "SequenceLabeler":
         """Create a labeler from YAML task configuration string."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
             f.write(yaml_str)
             f.flush()
             task_config = TaskExtractorConfig.load(f.name)
-        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale, early_stop)
 
     @classmethod
     def from_yaml_file(
-        cls, yaml_path: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+        cls,
+        yaml_path: str,
+        metadata_df: pl.DataFrame,
+        batch_size: int,
+        time_scale: TimeScale = "D",
+        early_stop: bool = False,
     ) -> "SequenceLabeler":
         """Create a labeler from YAML task configuration file."""
         task_config = TaskExtractorConfig.load(yaml_path)
-        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale, early_stop)
 
     @classmethod
     def from_task_config(
@@ -1301,16 +1375,19 @@ class SequenceLabeler:
         metadata_df: pl.DataFrame,
         batch_size: int,
         time_scale: TimeScale = "D",
+        early_stop: bool = False,
     ) -> "SequenceLabeler":
         """Create a labeler from TaskExtractorConfig object."""
-        tree = convert_task_config(config, batch_size, metadata_df)
+        tree = convert_task_config(config, batch_size, metadata_df, early_stop)
         gap_days, prior_windows, _ = calculate_index_timestamp_info(tree)
 
         # Initialize tree
         tree.root.initialize_batch(batch_size)
         tree.root.ignore_windows(prior_windows + ["trigger"])
 
-        return cls(tree=tree, gap_days=gap_days, batch_size=batch_size, time_scale=time_scale)
+        return cls(
+            tree=tree, gap_days=gap_days, batch_size=batch_size, time_scale=time_scale, early_stop=early_stop
+        )
 
     def process_step(
         self,
