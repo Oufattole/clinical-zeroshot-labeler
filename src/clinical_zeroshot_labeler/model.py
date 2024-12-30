@@ -230,6 +230,7 @@ class BaseGenerativeModel(ABC):
         cache_kv: bool = True,
         pad_value: int = 0,
         log_progress: bool = False,
+        do_slice: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, dict | None]:
         """Generate token sequences with model-specific processing.
@@ -356,26 +357,31 @@ class BaseGenerativeModel(ABC):
                 )
 
             while not is_finished:
-                # Get indices relative to original batch
-                orig_indices = (~ended_sequences).nonzero().squeeze(-1)
-                if len(orig_indices.shape) == 0:  # Handle single active sequence
-                    orig_indices = orig_indices.unsqueeze(0)
-
-                # Track which indices are active in our currently sliced tensors
-                active_indices = torch.arange(len(orig_indices), device=orig_indices.device)
-
                 # Track sliding window for full batch
                 x_full, cache_full, current_start_pos_full = self._track_sliding_window_generation(
                     out, max_seq_len, cache_kv, cache, transformer_decoder, seq_start_pos
                 )
+                if do_slice:  # TODO: test and debug do_slice
+                    # Get indices relative to original batch
+                    orig_indices = (~ended_sequences).nonzero().squeeze(-1)
+                    if len(orig_indices.shape) == 0:  # Handle single active sequence
+                        orig_indices = orig_indices.unsqueeze(0)
 
-                # Select active sequences and their cache
-                x = x_full[orig_indices]  # Use orig_indices for first slice from full batch
-                current_start_pos = (
-                    current_start_pos_full[orig_indices] if current_start_pos_full is not None else None
-                )
-                # Use active_indices for cache since it's already sliced
-                cache = slice_cache(cache_full, active_indices) if cache_full is not None else None
+                    # Track which indices are active in our currently sliced tensors
+                    active_indices = torch.arange(len(orig_indices), device=orig_indices.device)
+
+                    # Select active sequences and their cache
+                    x = x_full[orig_indices]  # Use orig_indices for first slice from full batch
+                    current_start_pos = (
+                        current_start_pos_full[orig_indices] if current_start_pos_full is not None else None
+                    )
+                    # Use active_indices for cache since it's already sliced
+                    cache = slice_cache(cache_full, active_indices) if cache_full is not None else None
+                else:
+                    active_indices = torch.arange(b, device=prompts.device)
+                    cache = cache_full
+                    current_start_pos = current_start_pos_full
+                    x = x_full
 
                 # Get next token predictions for active sequences only
                 logits, new_cache = transformer_decoder(

@@ -110,13 +110,15 @@ class MockTransformerWrapper(nn.Module):
         logits = torch.zeros((batch_size, seq_len, self.num_tokens), device=device)
 
         for b in range(batch_size):
-            if b < len(self.sequences) and self.current_positions[b] < len(self.sequences[b]):
+            if self.current_positions[b] < len(self.sequences[b]):
                 next_token = self.sequences[b][self.current_positions[b]][0]
                 logits[b, -1, next_token] = 1.0  # One-hot encoding for next token
                 self.current_positions[b] += 1
+                # if b == 1:
+                #     import pdb; pdb.set_trace()
             else:
                 # If we've exhausted the sequence, repeat last token
-                last_token = x[b, -1]
+                last_token = self.sequences[b][-1][0]
                 logits[b, -1, last_token] = 1.0
 
         # Handle KV caching
@@ -204,10 +206,10 @@ def test_single_sequence_generation(normal_sequence, metadata_df):  # noqa: F811
             self.expected_statuses = expected_statuses
 
         def process_step(self, tokens, times, values):
-            logger.info(f"tokens: {tokens}, times: {times}, values: {values}")
-            logger.info(f"step: {self.step}")
+            # logger.info(f"tokens: {tokens}, times: {times}, values: {values}")
+            # logger.info(f"step: {self.step}")
             status = self.expected_statuses[self.step]
-            logger.info(f"status: {status}")
+            # logger.info(f"status: {status}")
             self.step += 1
             return status
 
@@ -303,6 +305,7 @@ class MockGenerativeModel(BaseGenerativeModel):
         sequences=None,
         max_tokens=50,
         vocab_size=100,
+        gap_years=0,
     ):
         self.metadata_df = metadata_df
         self.model = SimpleNamespace()
@@ -313,6 +316,7 @@ class MockGenerativeModel(BaseGenerativeModel):
             dim=32,
         )
         self.cfg = DictConfig({"max_tokens_budget": max_tokens})
+        self.gap_years = gap_years
 
     def update_generation_state(self, tokens, cumulative_time, trajectory_labeler=None):
         """Update state based on labeler if provided."""
@@ -327,30 +331,26 @@ class MockGenerativeModel(BaseGenerativeModel):
             values = []
 
             for b in range(batch_size):
-                if b < len(sequences) and current_positions[b] > 0:
-                    # Use the time and value from the sequence
-                    _, time, value = sequences[b][current_positions[b] - 1]
-                    times.append(time)
-                    values.append(value)
-                else:
-                    times.append(0.0)
-                    values.append(0.0)
+                # Use the time and value from the sequence
+                _, time, value = sequences[b][current_positions[b] - 1]
+                times.append(time)
+                values.append(value)
 
-            times = torch.tensor(times, device=tokens.device)
+            times = torch.tensor(times, device=tokens.device) - self.gap_years
             values = torch.tensor(values, device=tokens.device)
 
             status = trajectory_labeler.process_step(tokens[:, -1], times, values)
             index_to_name = {
                 k: v for k, v in zip(self.metadata_df["code/vocab_index"], self.metadata_df["code"])
             }
-            token = tokens[:, -1][0]
-            token_name = index_to_name[token.item()]
+            token = tokens[:, -1]
+            token_name = [index_to_name[t.item()] for t in token]
             logger.info(
                 f"token_name: {token_name}, token: {token}, times: {times}, "
                 f"values: {values}, status: {status}"
             )
-            if hasattr(trajectory_labeler, "tree"):
-                print_window_tree_with_state(trajectory_labeler.tree.root)
+            # if hasattr(trajectory_labeler, "tree"):
+            #     print_window_tree_with_state(trajectory_labeler.tree.root)
 
             sequences_complete = status == WindowStatus.SATISFIED.value
 
@@ -367,6 +367,50 @@ class MockGenerativeModel(BaseGenerativeModel):
                 0
             ) < prompt_lens.unsqueeze(1)
         return torch.equal(right_pad_mask, mask)
+
+
+@pytest.fixture
+def multiple_icu_mortality(
+    successful_death_sequence,  # noqa: F811
+    successful_discharge_sequence,  # noqa: F811
+    impossible_readmission_sequence,  # noqa: F811
+    undetermined_sequence,  # noqa: F811
+    exact_boundary_sequence,  # noqa: F811
+    boundary_exclusion_sequence,  # noqa: F811
+    death_after_discharge_same_time_sequence,  # noqa: F811
+    death_before_discharge_same_time_sequence,  # noqa: F811
+    impossible_death_boundary_sequence,  # noqa: F811
+):
+    sequences = [
+        successful_death_sequence,
+        successful_discharge_sequence,
+        impossible_readmission_sequence,
+        undetermined_sequence,
+        exact_boundary_sequence,
+        boundary_exclusion_sequence,
+        death_after_discharge_same_time_sequence,
+        death_before_discharge_same_time_sequence,
+        impossible_death_boundary_sequence,
+    ]
+    expected_statuses = [seq["expected_statuses"] for seq in sequences]
+    max_len = max(len(statuses) for statuses in expected_statuses)
+
+    # Convert to list of tensors, one for each step
+    status_tensors = []
+    for step in range(max_len):
+        # For each step, get status from each example
+        # If past the end, use the final status
+        statuses = [
+            status_list[step].item() if step < len(status_list) else status_list[-1].item()
+            for status_list in expected_statuses
+        ]
+        status_tensors.append(torch.tensor(statuses))
+
+    return {
+        "sequence": [seq["sequence"] for seq in sequences],
+        "expected_statuses": status_tensors,
+        "label": [seq["label"] for seq in sequences],
+    }
 
 
 @pytest.mark.parametrize(
@@ -393,6 +437,7 @@ class MockGenerativeModel(BaseGenerativeModel):
         ("hematocrit_abnormal_sequence", "hematocrit_task_config_yaml"),
         ("hematocrit_boundary_sequence", "hematocrit_task_config_yaml"),
         ("hematocrit_threshold_sequence", "hematocrit_task_config_yaml"),
+        ("multiple_icu_mortality", "icu_morality_task_config_yaml"),
     ],
 )
 def test_sequence_generation(
@@ -415,8 +460,8 @@ def test_sequence_generation(
     )
 
     # Create model with sequence
-    model = MockGenerativeModel(metadata_df, sequences=sequence)
-    prompts = torch.zeros((batch_size,), dtype=torch.long)
+    model = MockGenerativeModel(metadata_df, sequences=sequence, gap_years=labeler.gap_days / 365)
+    prompts = torch.zeros((batch_size, 1), dtype=torch.long)
     mask = torch.ones_like(prompts, dtype=torch.bool)
 
     # Generate sequence and check against expected values

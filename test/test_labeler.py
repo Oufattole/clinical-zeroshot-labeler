@@ -18,9 +18,9 @@ SUCCESSFUL_DISCHARGE_SEQUENCE = {
         (5, 0.0, 0.0),  # Other event at index
         (5, 20.0, 0.0),  # Other event during input
         (5, 40.0, 0.0),  # Other event during gap
-        (5, 72.0, 0.0),  # Random Event after gap
-        (3, 72.0, 0.0),  # Hospital discharge after gap
-        (5, 73.0, 0.0),  # Other event after discharge
+        (5, 72.0, 0.0),  # Random Event at gap end
+        (3, 73.0, 0.0),  # Hospital discharge after gap
+        (5, 74.0, 0.0),  # Other event after discharge
     ],
     "expected_statuses": [
         torch.tensor([0]),  # Initial state
@@ -37,7 +37,7 @@ IMPOSSIBLE_READMISSION_SEQUENCE = {
     "sequence": [
         (5, 0.0, 0.0),  # Other event at index
         (5, 12.0, 0.0),  # Other event
-        (1, 24.0, 0.0),  # ICU readmission during gap
+        (1, 25.0, 0.0),  # ICU readmission during gap
         (4, 72.0, 0.0),  # Death (but already failed)
         (5, 73.0, 0.0),  # Other event after death
     ],
@@ -119,7 +119,7 @@ def print_window_tree_with_state(node, batch_idx=0, indent="", is_last=True, tim
 
     # Print current node with proper indentation and state
     branch = "└── " if is_last else "├── "
-    logger.info(f"{indent}{branch}{node.name}{state_info}")
+    print(f"{indent}{branch}{node.name}{state_info}")
 
     # Prepare indentation for children
     child_indent = indent + ("    " if is_last else "│   ")
@@ -504,9 +504,9 @@ def successful_discharge_sequence():
             (5, 0.0, 0.0),  # Other event at index
             (5, 20.0, 0.0),  # Other event during input
             (5, 40.0, 0.0),  # Other event during gap
-            (5, 72.0, 0.0),  # Random Event after gap
-            (3, 72.0, 0.0),  # Hospital discharge after gap
-            (5, 73.0, 0.0),  # Other event after discharge
+            (5, 72.0, 0.0),  # Random Event at gap end
+            (3, 73.0, 0.0),  # Hospital discharge after gap
+            (5, 74.0, 0.0),  # Other event after discharge
         ],
         "expected_statuses": [
             torch.tensor([0]),  # Initial state
@@ -526,7 +526,7 @@ def impossible_readmission_sequence():
         "sequence": [
             (5, 0.0, 0.0),  # Other event at index
             (5, 12.0, 0.0),  # Other event
-            (1, 24.0, 0.0),  # ICU readmission during gap
+            (1, 25.0, 0.0),  # ICU readmission during gap
             (4, 72.0, 0.0),  # Death (but already failed)
             (5, 73.0, 0.0),  # Other event after death
         ],
@@ -569,7 +569,7 @@ def exact_boundary_sequence():
             (5, 0.0, 0.0),  # Other event at index
             (5, 24.0, 0.0),  # Event exactly at input window boundary
             (5, 48.0, 0.0),  # Event exactly at gap window boundary
-            (5, 72.1, 0.0),  # Event exactly at gap window boundary
+            (5, 72.0, 0.0),  # Event exactly at gap window boundary
             (4, 72.1, 0.0),  # Death just after minimum time
             (5, 72.1, 0.0),  # Death just after minimum time
             (5, 72.2, 0.0),  # Random event after
@@ -905,18 +905,21 @@ def test_sequence_labeler(metadata_df, sequence_fixture_name, task_yaml_name, re
     labeler = SequenceLabeler.from_yaml_str(
         task_config_yaml, metadata_df, batch_size=batch_size, time_scale=time_scale
     )
+    gap_years = labeler.gap_days / 365
 
     # Set up model
     model = SimpleGenerativeModel(sequence)
     prompts = torch.zeros((batch_size), dtype=torch.long)
+    print_window_tree_with_state(labeler.tree.root)
 
     # Process each step
     for step, expected_status in enumerate(expected_statuses):
         next_tokens, next_times, numeric_values = model.generate_next_token(prompts)
-        status = labeler.process_step(next_tokens, next_times, numeric_values).clone()
+        status = labeler.process_step(next_tokens, next_times - gap_years, numeric_values).clone()
         # TODO: We currently don't check whether it correctly tracks being in WindowStatus 0 or 1
-        status[status == 0] += 1
-        expected_status[expected_status == 0] += 1
+        print_window_tree_with_state(labeler.tree.root)
+        status[status == 0] = 1
+        expected_status[expected_status == 0] = 1
 
         assert torch.equal(status, expected_status), (
             f"{sequence_fixture_name} ({time_scale}) - Step {step}: "
