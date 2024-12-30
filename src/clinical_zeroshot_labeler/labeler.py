@@ -443,9 +443,6 @@ class PredicateTensor:
             # Handle plain predicate - has tokens but no children
             tokens = metadata_df.filter(get_meds_expr(predicate))["code/vocab_index"].to_torch()
 
-            if tokens.shape[0] == 0:
-                logger.warning(f"Predicate {predicate_name} matched no codes")
-
             value_limits = (predicate.value_min, predicate.value_max)
             value_inclusions = (predicate.value_min_inclusive, predicate.value_max_inclusive)
 
@@ -498,9 +495,6 @@ def get_predicate_tensor(
     if isinstance(predicate, PlainPredicateConfig):
         # Handle plain predicate
         predicate_tensor = metadata_df.filter(get_meds_expr(predicate))["code/vocab_index"].to_torch()
-
-        if predicate_tensor.shape[0] == 0:
-            logger.warning(f"Predicate {predicate_name} returned no rows. Skipping it.")
 
         value_limits = (predicate.value_min, predicate.value_max)
         value_inclusions = (predicate.value_min_inclusive, predicate.value_max_inclusive)

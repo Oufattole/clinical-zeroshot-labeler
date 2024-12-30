@@ -122,6 +122,7 @@ class MockTransformerWrapper(nn.Module):
             status = self.labeler.get_status()
             active_mask = ~torch.isin(status, torch.tensor([2, 3], device=device))
             active_indices = active_mask.nonzero().squeeze(-1)
+            assert batch_size == active_indices.shape[0]
 
             # Update positions and set logits for active sequences
             for idx, orig_idx in enumerate(active_indices):
@@ -373,10 +374,10 @@ class MockGenerativeModel(BaseGenerativeModel):
             token = tokens[:, -1]
             token_name = [index_to_name[t.item()] for t in token]
             logger.info(f"{token_name}: {token}, times: {times}, status: {status}")
-            # if hasattr(trajectory_labeler, "tree"):
-            #     print_window_tree_with_state(trajectory_labeler.tree.root)
 
-            sequences_complete = status == WindowStatus.SATISFIED.value
+            sequences_complete = (status == WindowStatus.SATISFIED.value) | (
+                status == WindowStatus.IMPOSSIBLE.value
+            )
 
             return cumulative_time + times, status, sequences_complete.all(), sequences_complete
 
@@ -410,11 +411,11 @@ def multiple_icu_mortality(
         successful_discharge_sequence,
         impossible_readmission_sequence,
         undetermined_sequence,
-        # exact_boundary_sequence,
+        exact_boundary_sequence,
         boundary_exclusion_sequence,
-        # death_after_discharge_same_time_sequence,
-        # death_before_discharge_same_time_sequence,
-        # impossible_death_boundary_sequence,
+        death_after_discharge_same_time_sequence,
+        death_before_discharge_same_time_sequence,
+        impossible_death_boundary_sequence,
     ]
     expected_statuses = [seq["expected_statuses"] for seq in sequences]
     max_len = max(len(statuses) for statuses in expected_statuses)
