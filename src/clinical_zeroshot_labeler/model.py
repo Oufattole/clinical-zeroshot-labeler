@@ -32,10 +32,10 @@ from x_transformers.autoregressive_wrapper import (
 from clinical_zeroshot_labeler.labeler import SequenceLabeler, WindowStatus
 
 
-class RateColumn(ProgressColumn):  # pragma: no cover
+class RateColumn(ProgressColumn):
     """Renders human readable processing rate."""
 
-    def render(self, task: "Task") -> Text:
+    def render(self, task: "Task") -> Text:  # pragma: no cover
         """Render the speed in iterations per second."""
         speed = task.finished_speed or task.speed
         if speed is None:
@@ -60,36 +60,6 @@ def eval_decorator(fn):
         return out
 
     return inner
-
-
-def get_last_token(output: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """Get the last non-masked token from the output tensor.
-
-    Args: output (torch.Tensor): The output tensor of shape (batch_size, seq_len, hidden_dim) mask
-    (torch.Tensor): The mask tensor of shape (batch_size, seq_len) where True indicates masked positions
-
-    Returns: torch.Tensor: The last non-masked token for each sequence in the batch
-    """
-    # Find the last non-masked position
-    last_non_masked = (~mask).float().cumsum(dim=1).argmax(dim=1)
-
-    # Handle cases where all positions are masked
-    all_masked = mask.all(dim=1)
-    last_non_masked[all_masked] = 0
-
-    if all_masked.any():
-        raise ValueError(
-            f"{all_masked.sum().item()} sequences have all positions masked. Mask should likely be negated"
-        )
-
-    # Create indices for gathering
-    batch_size, _, hidden_dim = output.shape
-    indices = last_non_masked.view(batch_size, 1, 1).expand(-1, 1, hidden_dim)
-
-    # Gather the last non-masked tokens
-    last_token = torch.gather(output, dim=1, index=indices).squeeze(1)
-
-    return last_token
 
 
 def slice_cache(cache, active_indices):
@@ -346,7 +316,7 @@ class BaseGenerativeModel(ABC):
         )
 
         with progress:
-            if log_progress:
+            if log_progress:  # pragma: no cover
                 tokens_task = progress.add_task(
                     "[cyan]Tokens Generated...",  # Static description
                     total=self.cfg.max_tokens_budget if self.cfg.max_tokens_budget is not None else None,
@@ -364,8 +334,7 @@ class BaseGenerativeModel(ABC):
                 if prune_terminated:
                     # Get indices relative to original batch
                     orig_indices = (~ended_sequences).nonzero().squeeze(-1)
-                    if len(orig_indices.shape) == 0:  # Handle single active sequence
-                        orig_indices = orig_indices.unsqueeze(0)
+                    orig_indices = orig_indices.flatten()  # Handle single active sequence
 
                     # Track which indices are active in our currently sliced tensors
                     active_indices = torch.arange(len(orig_indices), device=orig_indices.device)
@@ -409,7 +378,7 @@ class BaseGenerativeModel(ABC):
 
                 # Update generation state
                 num_generated_tokens += 1
-                if log_progress:
+                if log_progress:  # pragma: no cover
                     progress.update(
                         tokens_task,
                         advance=1,
@@ -465,13 +434,6 @@ class DummyLabeler:
     def __init__(self):
         self.step = 0
 
-    def process_step(self, *args):
-        self.step += 1
-        return torch.tensor([WindowStatus.ACTIVE.value])
-
-    def is_finished(self):
-        return self.step >= 3
-
     def get_labels(self):
         return torch.tensor([1.0])
 
@@ -500,6 +462,3 @@ class TestModel(BaseGenerativeModel):
         else:
             status = None
         return time + 1, status, is_done, torch.tensor([is_done] * tokens.shape[0])
-
-    def process_generated_tokens(self, tokens, mask, metadata=None):
-        return {"tokens": tokens, "mask": mask}

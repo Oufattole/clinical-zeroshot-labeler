@@ -56,10 +56,12 @@ norecursedirs = ["helpers"]
 
 [tool.coverage.report]
 exclude_lines = [
-    "pragma: nocover",
     "raise NotImplementedError",
     "raise NotImplementedError()",
     "if __name__ == .__main__.:",
+]
+omit = [
+    "test/*",
 ]
 
 [project.urls]

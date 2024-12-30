@@ -68,16 +68,6 @@ class WindowState:
         self.status = torch.full((self.batch_size,), WindowStatus.UNDETERMINED.value, dtype=torch.long)
         self.waiting_for_next_time = torch.full((self.batch_size,), float("nan"))
 
-    def reset(self):
-        """Reset state for new sequence."""
-        self.start_time.fill_(float("nan"))
-        self.end_time.fill_(float("nan"))
-        self.in_window.fill_(False)
-        for counts in self.predicate_counts.values():
-            counts.fill_(0)
-        self.status.fill_(WindowStatus.UNDETERMINED.value)
-        self.waiting_for_next_time.fill_(float("nan"))
-
 
 T = None | int
 
@@ -1391,9 +1381,9 @@ class SequenceLabeler:
 
     def process_step(
         self,
-        tokens: torch.Tensor | list[int],
-        times: torch.Tensor | list[float],
-        values: torch.Tensor | list[float],
+        tokens: torch.Tensor,
+        times: torch.Tensor,
+        values: torch.Tensor,
     ) -> torch.Tensor:
         """
         Process one step of token sequences.
@@ -1406,14 +1396,6 @@ class SequenceLabeler:
         Returns:
             Tensor of status values for each sequence [batch_size]
         """
-        # Convert inputs to tensors if needed
-        if not isinstance(tokens, torch.Tensor):
-            tokens = torch.tensor(tokens, dtype=torch.long)
-        if not isinstance(times, torch.Tensor):
-            times = torch.tensor(times, dtype=torch.float)
-        if not isinstance(values, torch.Tensor):
-            values = torch.tensor(values, dtype=torch.float)
-
         # Ensure proper shapes
         tokens = tokens.view(self.batch_size)
         times = times.view(self.batch_size)
