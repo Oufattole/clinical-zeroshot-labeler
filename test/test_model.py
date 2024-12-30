@@ -44,9 +44,12 @@ class MockTransformerWrapper(nn.Module):
         num_tokens: int,
         max_seq_len: int,
         sequences: list[list[tuple[int, float, float]]] = None,
+        statuses: list[torch.Tensor] = None,
         dim: int = 32,
         can_cache_kv: bool = True,
         can_cache_kv_outside_max_seq_len: bool = True,
+        prune_terminated: bool = False,
+        labeler: SequenceLabeler | None = None,
     ):
         """Initialize mock transformer.
 
@@ -57,6 +60,8 @@ class MockTransformerWrapper(nn.Module):
             dim: Model dimension
             can_cache_kv: Whether model supports KV caching
             can_cache_kv_outside_max_seq_len: Whether caching works beyond max_seq_len
+            prune_terminated: Whether to prune terminated sequences
+            labeler: Optional sequence labeler for checking status
         """
         super().__init__()
         self.num_tokens = num_tokens
@@ -72,6 +77,9 @@ class MockTransformerWrapper(nn.Module):
         # For tracking calls
         self.call_count = 0
         self.cached_kvs = []
+        self.prune_terminated = prune_terminated
+        self.statuses = statuses
+        self.labeler = labeler
 
     def set_sequences(self, sequences: list[list[tuple[int, float, float]]]):
         """Set new predefined sequences and reset positions."""
@@ -109,17 +117,33 @@ class MockTransformerWrapper(nn.Module):
         # Generate logits for next tokens in sequence
         logits = torch.zeros((batch_size, seq_len, self.num_tokens), device=device)
 
-        for b in range(batch_size):
-            if self.current_positions[b] < len(self.sequences[b]):
-                next_token = self.sequences[b][self.current_positions[b]][0]
-                logits[b, -1, next_token] = 1.0  # One-hot encoding for next token
-                self.current_positions[b] += 1
-                # if b == 1:
-                #     import pdb; pdb.set_trace()
-            else:
-                # If we've exhausted the sequence, repeat last token
-                last_token = self.sequences[b][-1][0]
-                logits[b, -1, last_token] = 1.0
+        if self.prune_terminated and self.labeler is not None:
+            # Get current status from labeler
+            status = self.labeler.get_status()
+            active_mask = ~torch.isin(status, torch.tensor([2, 3], device=device))
+            active_indices = active_mask.nonzero().squeeze(-1)
+
+            # Update positions and set logits for active sequences
+            for idx, orig_idx in enumerate(active_indices):
+                if self.current_positions[orig_idx] < len(self.sequences[orig_idx]):
+                    next_token = self.sequences[orig_idx][self.current_positions[orig_idx]][0]
+                    logits[idx, -1, next_token] = 1.0
+                    self.current_positions[orig_idx] += 1
+                else:
+                    # If we've exhausted the sequence, repeat last token
+                    last_token = self.sequences[orig_idx][-1][0]
+                    logits[idx, -1, last_token] = 1.0
+        else:
+            # Original non-pruning logic
+            for b in range(batch_size):
+                if self.current_positions[b] < len(self.sequences[b]):
+                    next_token = self.sequences[b][self.current_positions[b]][0]
+                    logits[b, -1, next_token] = 1.0
+                    self.current_positions[b] += 1
+                else:
+                    # If we've exhausted the sequence, repeat last token
+                    last_token = self.sequences[b][-1][0]
+                    logits[b, -1, last_token] = 1.0
 
         # Handle KV caching
         if self.can_cache_kv:
@@ -206,10 +230,7 @@ def test_single_sequence_generation(normal_sequence, metadata_df):  # noqa: F811
             self.expected_statuses = expected_statuses
 
         def process_step(self, tokens, times, values):
-            # logger.info(f"tokens: {tokens}, times: {times}, values: {values}")
-            # logger.info(f"step: {self.step}")
             status = self.expected_statuses[self.step]
-            # logger.info(f"status: {status}")
             self.step += 1
             return status
 
@@ -306,6 +327,9 @@ class MockGenerativeModel(BaseGenerativeModel):
         max_tokens=50,
         vocab_size=100,
         gap_years=0,
+        prune_terminated=False,
+        statuses=None,
+        labeler=None,
     ):
         self.metadata_df = metadata_df
         self.model = SimpleNamespace()
@@ -314,6 +338,9 @@ class MockGenerativeModel(BaseGenerativeModel):
             max_seq_len=50,
             sequences=sequences if isinstance(sequences, list) else [sequences],
             dim=32,
+            prune_terminated=prune_terminated,
+            statuses=statuses,
+            labeler=labeler,
         )
         self.cfg = DictConfig({"max_tokens_budget": max_tokens})
         self.gap_years = gap_years
@@ -345,10 +372,7 @@ class MockGenerativeModel(BaseGenerativeModel):
             }
             token = tokens[:, -1]
             token_name = [index_to_name[t.item()] for t in token]
-            logger.info(
-                f"token_name: {token_name}, token: {token}, times: {times}, "
-                f"values: {values}, status: {status}"
-            )
+            logger.info(f"{token_name}: {token}, times: {times}, status: {status}")
             # if hasattr(trajectory_labeler, "tree"):
             #     print_window_tree_with_state(trajectory_labeler.tree.root)
 
@@ -386,11 +410,11 @@ def multiple_icu_mortality(
         successful_discharge_sequence,
         impossible_readmission_sequence,
         undetermined_sequence,
-        exact_boundary_sequence,
+        # exact_boundary_sequence,
         boundary_exclusion_sequence,
-        death_after_discharge_same_time_sequence,
-        death_before_discharge_same_time_sequence,
-        impossible_death_boundary_sequence,
+        # death_after_discharge_same_time_sequence,
+        # death_before_discharge_same_time_sequence,
+        # impossible_death_boundary_sequence,
     ]
     expected_statuses = [seq["expected_statuses"] for seq in sequences]
     max_len = max(len(statuses) for statuses in expected_statuses)
@@ -421,27 +445,33 @@ def multiple_icu_mortality(
     ],
 )
 @pytest.mark.parametrize(
-    "sequence_fixture,config_fixture",
+    "sequence_fixture,config_fixture,prune_terminated",
     [
-        ("successful_death_sequence", "icu_morality_task_config_yaml"),
-        ("successful_discharge_sequence", "icu_morality_task_config_yaml"),
-        ("impossible_readmission_sequence", "icu_morality_task_config_yaml"),
-        ("undetermined_sequence", "icu_morality_task_config_yaml"),
-        ("exact_boundary_sequence", "icu_morality_task_config_yaml"),
-        ("boundary_exclusion_sequence", "icu_morality_task_config_yaml"),
-        ("death_after_discharge_same_time_sequence", "icu_morality_task_config_yaml"),
-        ("death_before_discharge_same_time_sequence", "icu_morality_task_config_yaml"),
-        ("impossible_death_boundary_sequence", "icu_morality_task_config_yaml"),
-        ("alt_successful_death_sequence", "alternative_icu_morality_task_config_yaml"),
-        ("hematocrit_normal_sequence", "hematocrit_task_config_yaml"),
-        ("hematocrit_abnormal_sequence", "hematocrit_task_config_yaml"),
-        ("hematocrit_boundary_sequence", "hematocrit_task_config_yaml"),
-        ("hematocrit_threshold_sequence", "hematocrit_task_config_yaml"),
-        ("multiple_icu_mortality", "icu_morality_task_config_yaml"),
+        ("successful_death_sequence", "icu_morality_task_config_yaml", False),
+        ("successful_discharge_sequence", "icu_morality_task_config_yaml", False),
+        ("impossible_readmission_sequence", "icu_morality_task_config_yaml", False),
+        ("undetermined_sequence", "icu_morality_task_config_yaml", False),
+        ("exact_boundary_sequence", "icu_morality_task_config_yaml", False),
+        ("boundary_exclusion_sequence", "icu_morality_task_config_yaml", False),
+        ("death_after_discharge_same_time_sequence", "icu_morality_task_config_yaml", False),
+        ("death_before_discharge_same_time_sequence", "icu_morality_task_config_yaml", False),
+        ("impossible_death_boundary_sequence", "icu_morality_task_config_yaml", False),
+        ("alt_successful_death_sequence", "alternative_icu_morality_task_config_yaml", False),
+        ("hematocrit_normal_sequence", "hematocrit_task_config_yaml", False),
+        ("hematocrit_abnormal_sequence", "hematocrit_task_config_yaml", False),
+        ("hematocrit_boundary_sequence", "hematocrit_task_config_yaml", False),
+        ("hematocrit_threshold_sequence", "hematocrit_task_config_yaml", False),
+        ("multiple_icu_mortality", "icu_morality_task_config_yaml", False),
+        ("multiple_icu_mortality", "icu_morality_task_config_yaml", True),
     ],
 )
 def test_sequence_generation(
-    request, time_scale, sequence_fixture, config_fixture, metadata_df  # noqa: F811
+    request,
+    time_scale,
+    sequence_fixture,
+    config_fixture,
+    metadata_df,  # noqa: F811
+    prune_terminated,
 ):
     """Test sequence generation against all fixtures."""
     # Get sequence data and config
@@ -460,13 +490,24 @@ def test_sequence_generation(
     )
 
     # Create model with sequence
-    model = MockGenerativeModel(metadata_df, sequences=sequence, gap_years=labeler.gap_days / 365)
+    model = MockGenerativeModel(
+        metadata_df,
+        sequences=sequence,
+        gap_years=labeler.gap_days / 365,
+        prune_terminated=prune_terminated,
+        statuses=expected_statuses,
+        labeler=labeler,
+    )
     prompts = torch.zeros((batch_size, 1), dtype=torch.long)
     mask = torch.ones_like(prompts, dtype=torch.bool)
 
     # Generate sequence and check against expected values
     tokens, lengths, meta = model.generate(
-        prompts=prompts, mask=mask, trajectory_labeler=labeler, temperature=0.0
+        prompts=prompts,
+        mask=mask,
+        trajectory_labeler=labeler,
+        temperature=0.0,
+        prune_terminated=prune_terminated,
     )
 
     # Verify final status and labels

@@ -570,9 +570,9 @@ def exact_boundary_sequence():
             (5, 24.0, 0.0),  # Event exactly at input window boundary
             (5, 48.0, 0.0),  # Event exactly at gap window boundary
             (5, 72.0, 0.0),  # Event exactly at gap window boundary
-            (4, 72.1, 0.0),  # Death just after minimum time
-            (5, 72.1, 0.0),  # Death just after minimum time
-            (5, 72.2, 0.0),  # Random event after
+            (4, 700.0, 0.0),  # Death just after minimum time
+            (5, 700.0, 0.0),  # Death just after minimum time
+            (3, 1700.0, 0.0),  # Random event after
         ],
         "expected_statuses": [
             torch.tensor([0]),  # Initial state

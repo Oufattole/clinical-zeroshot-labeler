@@ -230,7 +230,7 @@ class BaseGenerativeModel(ABC):
         cache_kv: bool = True,
         pad_value: int = 0,
         log_progress: bool = False,
-        do_slice: bool = False,
+        prune_terminated: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, dict | None]:
         """Generate token sequences with model-specific processing.
@@ -361,7 +361,7 @@ class BaseGenerativeModel(ABC):
                 x_full, cache_full, current_start_pos_full = self._track_sliding_window_generation(
                     out, max_seq_len, cache_kv, cache, transformer_decoder, seq_start_pos
                 )
-                if do_slice:  # TODO: test and debug do_slice
+                if prune_terminated:
                     # Get indices relative to original batch
                     orig_indices = (~ended_sequences).nonzero().squeeze(-1)
                     if len(orig_indices.shape) == 0:  # Handle single active sequence
@@ -379,6 +379,7 @@ class BaseGenerativeModel(ABC):
                     cache = slice_cache(cache_full, active_indices) if cache_full is not None else None
                 else:
                     active_indices = torch.arange(b, device=prompts.device)
+                    orig_indices = active_indices
                     cache = cache_full
                     current_start_pos = current_start_pos_full
                     x = x_full
@@ -389,17 +390,14 @@ class BaseGenerativeModel(ABC):
                 )
 
                 # Map logits back to full batch size
-                full_logits = torch.zeros(
-                    (b, logits.shape[1], logits.shape[2]), device=logits.device, dtype=logits.dtype
-                )
-                full_logits[active_indices] = logits
+                logits = logits[:, -1]
+                full_logits = torch.zeros((b, logits.shape[1]), device=logits.device, dtype=logits.dtype)
+                full_logits[orig_indices[active_indices]] = logits
                 logits = full_logits
 
                 # Update cache with pruned version
                 if cache_kv and transformer_decoder.can_cache_kv:
                     cache = new_cache
-
-                logits = logits[:, -1]
 
                 # Sample next tokens
                 if temperature == 0.0:  # greedy sampling

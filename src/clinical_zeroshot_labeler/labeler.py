@@ -947,6 +947,40 @@ class WindowNode:
 
         return self.state.status
 
+    def get_status(self) -> torch.Tensor:
+        status = self.state.status
+        # If this node is satisfied, process children
+        satisfied_mask = status == WindowStatus.SATISFIED.value
+        if self.children:
+            for child in self.children:
+                child_status = child.get_status()
+                # First check for IMPOSSIBLE
+                status = torch.where(
+                    satisfied_mask & (child_status == WindowStatus.IMPOSSIBLE.value),
+                    WindowStatus.IMPOSSIBLE.value,
+                    status,
+                )
+                # Then check for UNDETERMINED
+                status = torch.where(
+                    satisfied_mask
+                    & (status != WindowStatus.IMPOSSIBLE.value)
+                    & (child_status == WindowStatus.UNDETERMINED.value),
+                    WindowStatus.UNDETERMINED.value,
+                    status,
+                )
+                # Then check for ACTIVE
+                status = torch.where(
+                    satisfied_mask
+                    & (status != WindowStatus.IMPOSSIBLE.value)
+                    & (status != WindowStatus.UNDETERMINED.value)
+                    & (child_status == WindowStatus.ACTIVE.value),
+                    WindowStatus.ACTIVE.value,
+                    status,
+                )
+                # Keep SATISFIED only if all children are satisfied
+                #      (handled implicitly since we only update when child is not satisfied)
+        return status
+
 
 def process_node(
     node: WindowNode,
@@ -1325,6 +1359,9 @@ class SequenceLabeler:
         self._finished = ((status == 2) | (status == 3)).all()
 
         return status
+
+    def get_status(self) -> torch.Tensor:
+        return self.tree.root.get_status()
 
     def get_labels(self) -> torch.Tensor:
         """Get final binary labels for each sequence in the batch."""
