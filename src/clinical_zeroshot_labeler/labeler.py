@@ -422,46 +422,6 @@ class PredicateTensor:
         counts = self.get_count(state)
         return counts > max_count
 
-    @classmethod
-    def from_config(
-        cls, metadata_df: pl.DataFrame, config: TaskExtractorConfig, predicate_name: str
-    ) -> "PredicateTensor":
-        """Create a PredicateTensor from a task configuration."""
-        predicate = config.predicates[predicate_name]
-
-        if isinstance(predicate, PlainPredicateConfig):
-            # Handle plain predicate - has tokens but no children
-            tokens = metadata_df.filter(get_meds_expr(predicate))["code/vocab_index"].to_torch()
-
-            value_limits = (predicate.value_min, predicate.value_max)
-            value_inclusions = (predicate.value_min_inclusive, predicate.value_max_inclusive)
-
-            return cls(
-                name=predicate_name,
-                tokens=tokens,
-                value_limits=value_limits,
-                value_inclusions=value_inclusions,
-                children=[],
-                is_and=False,
-            )
-
-        elif isinstance(predicate, DerivedPredicateConfig):
-            # Handle derived predicate - has children but no tokens
-            children = [
-                cls.from_config(metadata_df, config, child_name) for child_name in predicate.input_predicates
-            ]
-
-            return cls(
-                name=predicate_name,
-                tokens=torch.tensor([], dtype=torch.long),
-                value_limits=(None, None),
-                value_inclusions=(None, None),
-                children=children,
-                is_and=predicate.is_and,
-            )
-        else:
-            raise ValueError(f"Unknown predicate type: {type(predicate)}")
-
 
 def get_predicate_tensor(
     metadata_df: pl.DataFrame, config: TaskExtractorConfig, predicate_name: str
