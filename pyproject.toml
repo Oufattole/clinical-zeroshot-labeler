@@ -26,7 +26,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "polars", "pyarrow", "omegaconf", "hydra-core", "rich", "hydra-colorlog", "loguru", "pytimeparse == 1.1.*", "networkx == 3.3.*", "bigtree == 0.18.*", "ruamel.yaml == 0.18.*", "torch", "numpy", "es-aces",
+    "polars", "pyarrow", "omegaconf", "hydra-core", "rich", "hydra-colorlog", "loguru", "pytimeparse == 1.1.*", "networkx == 3.3.*", "bigtree == 0.18.*", "ruamel.yaml == 0.18.*", "torch", "numpy", "es-aces", "x-transformers"
 ]
 
 [tool.setuptools_scm]
@@ -55,11 +55,13 @@ testpaths = "tests/"
 norecursedirs = ["helpers"]
 
 [tool.coverage.report]
-exclude_lines = [
-    "pragma: nocover",
+exclude_also = [
     "raise NotImplementedError",
     "raise NotImplementedError()",
     "if __name__ == .__main__.:",
+]
+omit = [
+    "test/*",
 ]
 
 [project.urls]

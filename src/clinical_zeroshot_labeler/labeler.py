@@ -68,18 +68,112 @@ class WindowState:
         self.status = torch.full((self.batch_size,), WindowStatus.UNDETERMINED.value, dtype=torch.long)
         self.waiting_for_next_time = torch.full((self.batch_size,), float("nan"))
 
-    def reset(self):
-        """Reset state for new sequence."""
-        self.start_time.fill_(float("nan"))
-        self.end_time.fill_(float("nan"))
-        self.in_window.fill_(False)
-        for counts in self.predicate_counts.values():
-            counts.fill_(0)
-        self.status.fill_(WindowStatus.UNDETERMINED.value)
-        self.waiting_for_next_time.fill_(float("nan"))
-
 
 T = None | int
+
+
+def get_meds_expr(predicate: PlainPredicateConfig) -> pl.Expr:
+    """Returns a Polars expression that evaluates this predicate for a MEDS formatted dataset.
+
+    Note: The output syntax for the following examples is dependent on the polars version used. The
+    expected outputs have been validated on polars version 0.20.30.
+
+    Examples:
+        >>> expr = get_meds_expr(PlainPredicateConfig("BP//systolic", 120, 140, True, False))
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//systolic))]
+        >>> cfg = PlainPredicateConfig("BP//systolic", value_min=120, value_min_inclusive=False)
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//systolic))]
+        >>> cfg = PlainPredicateConfig("BP//systolic", value_max=140, value_max_inclusive=True)
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//systolic))]
+        >>> cfg = PlainPredicateConfig("BP//diastolic")
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//diastolic))]
+        >>> cfg = PlainPredicateConfig("BP//diastolic", other_cols={"chamber": "atrial"})
+        >>> expr = get_meds_expr(cfg)
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        [(col("code")) == (String(BP//diastolic))].all_horizontal([[(col("chamber")) ==
+            (String(atrial))]])
+
+        >>> cfg = PlainPredicateConfig(code={'regex': None, 'any': None})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Only one of 'regex' or 'any' can be specified in the code field!
+        Got: ['regex', 'any'].
+        >>> cfg = PlainPredicateConfig(code={'foo': None})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid specification in the code field! Got: {'foo': None}.
+        Expected one of 'regex', 'any'.
+        >>> cfg = PlainPredicateConfig(code={'regex': ''})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid specification in the code field! Got: {'regex': ''}.
+        Expected a non-empty string for 'regex'.
+        >>> cfg = PlainPredicateConfig(code={'any': []})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        Traceback (most recent call last):
+            ...
+        ValueError: Invalid specification in the code field! Got: {'any': []}.
+        Expected a list of strings for 'any'.
+
+        >>> cfg = PlainPredicateConfig(code={'regex': '^foo.*'})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        col("code").str.contains([String(^foo.*)])
+        >>> cfg = PlainPredicateConfig(code={'any': ['foo', 'bar']})
+        >>> expr = get_meds_expr(cfg) # doctest: +NORMALIZE_WHITESPACE
+        >>> print(expr) # doctest: +NORMALIZE_WHITESPACE
+        col("code").is_in([Series])
+    """
+    criteria = []
+    if isinstance(predicate.code, dict):
+        if len(predicate.code) > 1:
+            raise ValueError(
+                "Only one of 'regex' or 'any' can be specified in the code field! "
+                f"Got: {list(predicate.code.keys())}."
+            )
+
+        if "regex" in predicate.code:
+            if not predicate.code["regex"] or not isinstance(predicate.code["regex"], str):
+                raise ValueError(
+                    "Invalid specification in the code field! "
+                    f"Got: {predicate.code}. "
+                    "Expected a non-empty string for 'regex'."
+                )
+            criteria.append(pl.col("code").str.contains(predicate.code["regex"]))
+        elif "any" in predicate.code:
+            if not predicate.code["any"] or not isinstance(predicate.code["any"], list):
+                raise ValueError(
+                    "Invalid specification in the code field! "
+                    f"Got: {predicate.code}. "
+                    f"Expected a list of strings for 'any'."
+                )
+            criteria.append(pl.Expr.is_in(pl.col("code"), predicate.code["any"]))
+        else:
+            raise ValueError(
+                "Invalid specification in the code field! "
+                f"Got: {predicate.code}. "
+                "Expected one of 'regex', 'any'."
+            )
+    else:
+        criteria.append(pl.col("code") == predicate.code)
+
+    if predicate.other_cols:
+        criteria.extend([pl.col(col) == value for col, value in predicate.other_cols.items()])
+
+    if len(criteria) == 1:
+        return criteria[0]
+    else:
+        return pl.all_horizontal(criteria)
 
 
 @dataclass
@@ -176,7 +270,7 @@ class PredicateTensor:
         ...     value_limits=(2.0, None),
         ...     value_inclusions=(True, None),
         ...     children=[],
-        ...     is_and=False
+        ...     is_and=False,
         ... )
 
         >>> # Test min/max constraints
@@ -328,49 +422,6 @@ class PredicateTensor:
         counts = self.get_count(state)
         return counts > max_count
 
-    @classmethod
-    def from_config(
-        cls, metadata_df: pl.DataFrame, config: TaskExtractorConfig, predicate_name: str
-    ) -> "PredicateTensor":
-        """Create a PredicateTensor from a task configuration."""
-        predicate = config.predicates[predicate_name]
-
-        if isinstance(predicate, PlainPredicateConfig):
-            # Handle plain predicate - has tokens but no children
-            tokens = metadata_df.filter(predicate.MEDS_eval_expr())["code/vocab_index"].to_torch()
-
-            if tokens.shape[0] == 0:
-                logger.warning(f"Predicate {predicate_name} matched no codes")
-
-            value_limits = (predicate.value_min, predicate.value_max)
-            value_inclusions = (predicate.value_min_inclusive, predicate.value_max_inclusive)
-
-            return cls(
-                name=predicate_name,
-                tokens=tokens,
-                value_limits=value_limits,
-                value_inclusions=value_inclusions,
-                children=[],
-                is_and=False,
-            )
-
-        elif isinstance(predicate, DerivedPredicateConfig):
-            # Handle derived predicate - has children but no tokens
-            children = [
-                cls.from_config(metadata_df, config, child_name) for child_name in predicate.input_predicates
-            ]
-
-            return cls(
-                name=predicate_name,
-                tokens=torch.tensor([], dtype=torch.long),
-                value_limits=(None, None),
-                value_inclusions=(None, None),
-                children=children,
-                is_and=predicate.is_and,
-            )
-        else:
-            raise ValueError(f"Unknown predicate type: {type(predicate)}")
-
 
 def get_predicate_tensor(
     metadata_df: pl.DataFrame, config: TaskExtractorConfig, predicate_name: str
@@ -393,10 +444,7 @@ def get_predicate_tensor(
 
     if isinstance(predicate, PlainPredicateConfig):
         # Handle plain predicate
-        predicate_tensor = metadata_df.filter(predicate.MEDS_eval_expr())["code/vocab_index"].to_torch()
-
-        if predicate_tensor.shape[0] == 0:
-            logger.warning(f"Predicate {predicate_name} returned no rows. Skipping it.")
+        predicate_tensor = metadata_df.filter(get_meds_expr(predicate))["code/vocab_index"].to_torch()
 
         value_limits = (predicate.value_min, predicate.value_max)
         value_inclusions = (predicate.value_min_inclusive, predicate.value_max_inclusive)
@@ -445,7 +493,220 @@ class EventBound(WindowBound):
 
 @dataclass
 class WindowNode:
-    """Node in autoregressive window tree."""
+    """Demonstration-only class with a single window constraint: we consider the
+    predicate "my_pred" satisfied if we see token == 3 at least once.
+
+    This is a simplified example to illustrate how the WindowNode can lead to
+    one sequence being satisfied early while another is still active in the same
+    batch.
+
+    >>> import torch
+    >>> from datetime import timedelta
+
+    >>> # Create a single WindowNode that requires the predicate "some_pred" at least once.
+    >>> # We'll define "some_pred" as a PredicateTensor matching token == 3.
+    >>> node = WindowNode(
+    ...     name="my_window",
+    ...     start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
+    ...     end_bound=TemporalBound(reference="trigger + 30h", inclusive=True, offset=timedelta(hours=30)),
+    ...     predicate_constraints={"some_pred": (1, None)},  # Must see at least 1 occurrence of "some_pred"
+    ...     label=None,
+    ...     index_timestamp=None,
+    ...     tensorized_predicates={
+    ...         "some_pred": PredicateTensor(
+    ...             name="some_pred",
+    ...             tokens=torch.tensor([3], dtype=torch.long),  # Token 3 triggers "some_pred"
+    ...             value_limits=(None, None),
+    ...             value_inclusions=(None, None),
+    ...             children=[],
+    ...             is_and=False,
+    ...         )
+    ...     }
+    ... )
+
+    >>> # Initialize batch_size=2 for two parallel sequences.
+    >>> node.initialize_batch(batch_size=2)
+
+    >>> # Step 1: Sequence 0 sees token=3 (constraint satisfied immediately),
+    >>> #         Sequence 1 sees token=5 (no effect).
+    >>> step_1_status = node.update(
+    ...     time_deltas=torch.tensor([0.0, 0.0]),
+    ...     event_tokens=torch.tensor([3, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_1_status # Sequence 0 and 1 are Active
+    tensor([1, 1])
+    >>> step_2_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 0.0]),
+    ...     event_tokens=torch.tensor([3, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_2_status # Sequence 0 is SATISFIED=2, Sequence 1 is ACTIVE=1
+    tensor([2, 1])
+
+    >>> # Step 2: We must still pass tokens for Sequence 0, even though it's satisfied.
+    >>> #         Both sequences see token=5 here => no new progress for Sequence 1.
+    >>> step_3_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 1.0]),
+    ...     event_tokens=torch.tensor([5, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_3_status # Sequence 0 stays SATISFIED, Sequence 1 remains ACTIVE
+    tensor([2, 1])
+
+    >>> # Step 3: Finally, Sequence 1 sees token=3 => so it should become satisfied
+    >>> #         after passing the time window.
+    >>> step_3_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 1.0]),
+    ...     event_tokens=torch.tensor([5, 3]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_3_status # Now both sequences are SATISFIED
+    tensor([2, 1])
+
+    >>> # Step 4: Finally, Sequence 1 completes the time window so => it becomes SATISFIED.
+    >>> step_4_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 2.0]),
+    ...     event_tokens=torch.tensor([5, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_4_status # Now both sequences are SATISFIED
+    tensor([2, 2])
+
+
+    If we enable early stopping for temporal windows, we can stop sequences that are still in the window
+    as soon as a positive label is observed
+
+    >>> # Create a single WindowNode that requires the predicate "some_pred" at least once.
+    >>> # We'll define "some_pred" as a PredicateTensor matching token == 3.
+    >>> node = WindowNode(
+    ...     name="my_window",
+    ...     start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
+    ...     end_bound=TemporalBound(reference="trigger + 30h", inclusive=True, offset=timedelta(hours=30)),
+    ...     predicate_constraints={},  # Must see at least 1 occurrence of "some_pred"
+    ...     label="some_pred",
+    ...     index_timestamp=None,
+    ...     tensorized_predicates={
+    ...         "some_pred": PredicateTensor(
+    ...             name="some_pred",
+    ...             tokens=torch.tensor([3], dtype=torch.long),  # Token 3 triggers "some_pred"
+    ...             value_limits=(None, None),
+    ...             value_inclusions=(None, None),
+    ...             children=[],
+    ...             is_and=False,
+    ...         )
+    ...     },
+    ...     early_stop=True,
+    ... )
+
+    >>> # Initialize batch_size=2 for two parallel sequences.
+    >>> node.initialize_batch(batch_size=2)
+
+    >>> # Step 1: Sequence 0 sees token=3 (it early stops within the temporal window as the label is known),
+    >>> #         Sequence 1 sees token=5 (no effect).
+    >>> step_1_status = node.update(
+    ...     time_deltas=torch.tensor([0.0, 0.0]),
+    ...     event_tokens=torch.tensor([3, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_1_status #
+    tensor([2, 1])
+
+    >>> # Step 2: We must still pass tokens for Sequence 0, even though it's satisfied.
+    >>> #         Both sequences see token=5 here => no new progress for Sequence 1.
+    >>> step_2_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 1.0]),
+    ...     event_tokens=torch.tensor([5, 5]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_2_status # Sequence 0 stays SATISFIED, Sequence 1 remains ACTIVE
+    tensor([2, 1])
+
+    >>> # Step 3: Finally, Sequence 1 sees token=3 => so it should become satisfied
+    >>> #         after passing the time window.
+    >>> step_3_status = node.update(
+    ...     time_deltas=torch.tensor([2.0, 1.0]),
+    ...     event_tokens=torch.tensor([5, 3]),
+    ...     numeric_values=torch.tensor([0.0, 0.0]),
+    ... )
+    >>> step_3_status # Now both sequences are SATISFIED
+    tensor([2, 2])
+
+
+    Test event-based end bounds and continued tracking after satisfaction:
+
+    >>> # Create a window that ends on a specific event (token=4)
+    >>> end_predicate = PredicateTensor(
+    ...     name="end_pred",
+    ...     tokens=torch.tensor([4], dtype=torch.long),  # Token 4 ends the window
+    ...     value_limits=(None, None),
+    ...     value_inclusions=(None, None),
+    ...     children=[],
+    ...     is_and=False,
+    ... )
+    >>> event_window = WindowNode(
+    ...     name="event_window",
+    ...     start_bound=TemporalBound(reference="trigger", inclusive=True, offset=timedelta(0)),
+    ...     end_bound=EventBound(
+    ...         reference="window_name",
+    ...         inclusive=True,
+    ...         predicate=end_predicate,  # PredicateTensor for token 4
+    ...         direction="next"      # Look for next occurrence
+    ...     ),
+    ...     predicate_constraints={"some_pred": (1, None)},  # At least one token 3
+    ...     label=None,
+    ...     index_timestamp=None,
+    ...     tensorized_predicates={"end_pred": end_predicate,
+    ...         "some_pred": PredicateTensor(
+    ...             name="some_pred",
+    ...             tokens=torch.tensor([3], dtype=torch.long),
+    ...             value_limits=(None, None),
+    ...             value_inclusions=(None, None),
+    ...             children=[],
+    ...             is_and=False,
+    ...         )
+    ...     }
+    ... )
+    >>> event_window.initialize_batch(batch_size=1)
+
+    >>> # First event satisfies predicate but doesn't end window
+    >>> status = event_window.update(
+    ...     time_deltas=torch.tensor([0.0]),
+    ...     event_tokens=torch.tensor([3]),
+    ...     numeric_values=torch.tensor([0.0])
+    ... )
+    >>> status  # Window should be ACTIVE until we see token 4
+    tensor([1])
+    >>> event_window.state.predicate_counts["some_pred"]  # Should count the event
+    tensor([1])
+
+    >>> # Second event is token 3 again - should still be counted
+    >>> status = event_window.update(
+    ...     time_deltas=torch.tensor([1.0]),
+    ...     event_tokens=torch.tensor([3]),
+    ...     numeric_values=torch.tensor([0.0])
+    ... )
+    >>> event_window.state.predicate_counts["some_pred"]  # Should be 2 but is still 1
+    tensor([2])
+    >>> status
+    tensor([1])
+
+    >>> # Third event is token 4 - this is the end bound token
+    >>> status = event_window.update(
+    ...     time_deltas=torch.tensor([2.0]),
+    ...     event_tokens=torch.tensor([4]),
+    ...     numeric_values=torch.tensor([0.0])
+    ... )
+    >>> status  # Should remain active until a new time is reached
+    tensor([1])
+    >>> status = event_window.update(
+    ...     time_deltas=torch.tensor([3.0]),
+    ...     event_tokens=torch.tensor([0]),
+    ...     numeric_values=torch.tensor([0.0])
+    ... )
+    >>> status  # Should transition to SATISFIED as end is reached
+    tensor([2])
+    """
 
     name: str
     start_bound: TemporalBound | EventBound
@@ -459,6 +720,7 @@ class WindowNode:
     state: WindowState | None = None
     ignore: bool = False
     label_value: bool | None = None
+    early_stop: bool = False
 
     def get_labels(self):
         if self.label is not None:
@@ -510,7 +772,12 @@ class WindowNode:
             else:
                 raise NotImplementedError("Previous event bounds not yet supported")
 
-    def _check_end_condition(self, time_delta: torch.Tensor, event_token: torch.Tensor) -> torch.Tensor:
+    def is_active_status(self) -> torch.Tensor:
+        return (self.state.status != WindowStatus.SATISFIED.value) & (
+            self.state.status != WindowStatus.IMPOSSIBLE.value
+        )
+
+    def _check_end_condition(self, time_delta: torch.Tensor) -> torch.Tensor:
         """Check if window should end at current time/event."""
         if self.end_bound.bound_type == BoundType.TEMPORAL:
             ref_time = torch.zeros_like(time_delta)
@@ -550,6 +817,8 @@ class WindowNode:
 
         # For other windows, need to wait for window end
         if isinstance(self.end_bound, TemporalBound):
+            if self.early_stop and self.label_value is not None:
+                return satisfied & (self.label_value | ~torch.isnan(self.state.end_time))
             return satisfied & ~torch.isnan(self.state.end_time)
         else:
             if isinstance(self.end_bound.predicate, str):
@@ -572,17 +841,9 @@ class WindowNode:
 
         return impossible
 
-    def update(
-        self,
-        time_deltas: torch.Tensor,
-        event_tokens: torch.Tensor,
-        numeric_values: torch.Tensor,
-    ) -> torch.Tensor:
-        """Update state for batch."""
-        if self.ignore:
-            return torch.full_like(self.state.status, WindowStatus.SATISFIED.value)
-
-        # Handle waiting for next time point
+    def _handle_waiting_state(
+        self, time_deltas: torch.Tensor, event_tokens: torch.Tensor, numeric_values: torch.Tensor
+    ):
         waiting_mask = ~torch.isnan(self.state.waiting_for_next_time)
         if waiting_mask.any():
             past_wait_time = time_deltas > self.state.waiting_for_next_time
@@ -597,6 +858,8 @@ class WindowNode:
 
             # Update counts for those still waiting
             if still_waiting.any():
+                # TODO: This could lead to double counting as we update counts later in
+                #       the update function as well.
                 self._update_counts(event_tokens, numeric_values)
 
             # Clear waiting times for satisfied sequences
@@ -604,15 +867,7 @@ class WindowNode:
                 newly_satisfied, torch.tensor(float("nan")), self.state.waiting_for_next_time
             )
 
-        # Don't update if already determined
-        active_mask = (self.state.status != WindowStatus.SATISFIED.value) & (
-            self.state.status != WindowStatus.IMPOSSIBLE.value
-        )
-
-        if not active_mask.any():
-            return self.state.status
-
-        # Check window start
+    def _handle_newly_started(self, active_mask, time_deltas: torch.Tensor, event_tokens: torch.Tensor):
         start_mask = active_mask & torch.isnan(self.state.start_time)
         should_start = self._check_start_condition(time_deltas, event_tokens)
         new_starts = start_mask & should_start
@@ -624,20 +879,28 @@ class WindowNode:
                 new_starts, torch.tensor(WindowStatus.ACTIVE.value), self.state.status
             )
 
-        # Update counts for active windows
+    def _handle_end_mask(self, end_mask, time_deltas):
+        if end_mask.any():
+            self.state.end_time = torch.where(end_mask, time_deltas, self.state.end_time)
+            self.state.in_window &= ~end_mask
+
+            satisfied_at_end = self._check_constraints_satisfied()
+
+            self.state.status = torch.where(
+                end_mask & satisfied_at_end,
+                torch.tensor(WindowStatus.SATISFIED.value),
+                torch.where(end_mask, torch.tensor(WindowStatus.IMPOSSIBLE.value), self.state.status),
+            )
+
+    def _handle_update(self, active_mask, time_deltas, event_tokens, numeric_values):
         update_mask = self.state.in_window & active_mask
         if update_mask.any():
             self._update_counts(event_tokens, numeric_values)
-            self.state.status = torch.where(
-                update_mask, torch.tensor(WindowStatus.ACTIVE.value), self.state.status
-            )
             self._check_label()
 
             # Check constraints
             impossible = self._check_constraints_impossible()
             satisfied = self._check_constraints_satisfied()
-            if self.label_value is not None:
-                satisfied = satisfied | self.label_value
 
             # Update status based on constraints
             self.state.status = torch.where(
@@ -657,22 +920,70 @@ class WindowNode:
                 )
                 self.state.in_window &= ~newly_satisfied
 
-        # Check window end
-        should_end = self._check_end_condition(time_deltas, event_tokens)
+    def update(
+        self,
+        time_deltas: torch.Tensor,
+        event_tokens: torch.Tensor,
+        numeric_values: torch.Tensor,
+    ) -> torch.Tensor:
+        """Update state for batch."""
+        if self.ignore:
+            return torch.full_like(self.state.status, WindowStatus.SATISFIED.value)
+
+        # Handle waiting state first
+        self._handle_waiting_state(time_deltas, event_tokens, numeric_values)
+
+        # Check windows that ended
+        should_end = self._check_end_condition(time_deltas)
         end_mask = self.state.in_window & should_end
+        self._handle_end_mask(end_mask, time_deltas)
 
-        if end_mask.any():
-            self.state.end_time = torch.where(end_mask, time_deltas, self.state.end_time)
-            self.state.in_window &= ~end_mask
+        # Don't continue if no sequences are active
+        active_mask = self.is_active_status()
+        if not active_mask.any():
+            return self.state.status
 
-            satisfied_at_end = self._check_constraints_satisfied()
-            self.state.status = torch.where(
-                end_mask & satisfied_at_end,
-                torch.tensor(WindowStatus.SATISFIED.value),
-                torch.where(end_mask, torch.tensor(WindowStatus.IMPOSSIBLE.value), self.state.status),
-            )
+        # Check window start
+        self._handle_newly_started(active_mask, time_deltas, event_tokens)
+
+        # Update counts for active windows
+        self._handle_update(active_mask, time_deltas, event_tokens, numeric_values)
 
         return self.state.status
+
+    def get_status(self) -> torch.Tensor:
+        status = self.state.status
+        # If this node is satisfied, process children
+        satisfied_mask = status == WindowStatus.SATISFIED.value
+        if self.children:
+            for child in self.children:
+                child_status = child.get_status()
+                # First check for IMPOSSIBLE
+                status = torch.where(
+                    satisfied_mask & (child_status == WindowStatus.IMPOSSIBLE.value),
+                    WindowStatus.IMPOSSIBLE.value,
+                    status,
+                )
+                # Then check for UNDETERMINED
+                status = torch.where(
+                    satisfied_mask
+                    & (status != WindowStatus.IMPOSSIBLE.value)
+                    & (child_status == WindowStatus.UNDETERMINED.value),
+                    WindowStatus.UNDETERMINED.value,
+                    status,
+                )
+                # Then check for ACTIVE
+                status = torch.where(
+                    satisfied_mask
+                    & (status != WindowStatus.IMPOSSIBLE.value)
+                    & (status != WindowStatus.UNDETERMINED.value)
+                    & (child_status == WindowStatus.ACTIVE.value),
+                    WindowStatus.ACTIVE.value,
+                    status,
+                )
+                # Keep SATISFIED only if all children are satisfied
+                #      (handled implicitly since we only update when child is not satisfied)
+        return status
 
 
 def process_node(
@@ -690,14 +1001,34 @@ def process_node(
 
     # If this node is satisfied, process children
     satisfied_mask = status == WindowStatus.SATISFIED.value
-    if satisfied_mask.any() and node.children:
+    if node.children:
         for child in node.children:
             child_status = process_node(child, tokens, time_deltas, numeric_values)
-            # Update parent status where children are not satisfied
+            # First check for IMPOSSIBLE
             status = torch.where(
-                satisfied_mask & (child_status != WindowStatus.SATISFIED.value), child_status, status
+                satisfied_mask & (child_status == WindowStatus.IMPOSSIBLE.value),
+                WindowStatus.IMPOSSIBLE.value,
+                status,
             )
-
+            # Then check for UNDETERMINED
+            status = torch.where(
+                satisfied_mask
+                & (status != WindowStatus.IMPOSSIBLE.value)
+                & (child_status == WindowStatus.UNDETERMINED.value),
+                WindowStatus.UNDETERMINED.value,
+                status,
+            )
+            # Then check for ACTIVE
+            status = torch.where(
+                satisfied_mask
+                & (status != WindowStatus.IMPOSSIBLE.value)
+                & (status != WindowStatus.UNDETERMINED.value)
+                & (child_status == WindowStatus.ACTIVE.value),
+                WindowStatus.ACTIVE.value,
+                status,
+            )
+            # Keep SATISFIED only if all children are satisfied
+            #      (handled implicitly since we only update when child is not satisfied)
     return status
 
 
@@ -797,7 +1128,7 @@ def calculate_index_timestamp_info(tree: AutoregressiveWindowTree) -> tuple[floa
 
 
 def convert_task_config(
-    config: TaskExtractorConfig, batch_size: int, metadata_df: pl.DataFrame
+    config: TaskExtractorConfig, batch_size: int, metadata_df: pl.DataFrame, early_stop: bool = False
 ) -> AutoregressiveWindowTree:
     """Convert TaskExtractorConfig to AutoregressiveWindowTree.
 
@@ -823,6 +1154,7 @@ def convert_task_config(
         label=None,
         index_timestamp=None,
         tensorized_predicates=tensorized_predicates,
+        early_stop=early_stop,
     )
 
     def convert_endpoint_expr(
@@ -870,14 +1202,19 @@ def convert_task_config(
 
         # Create window node with converted bounds
         if start_bound is None:
-            parent_window_name, start_or_end = window.start.split(".")
-            if start_or_end == "start":
-                start_bound = all_nodes[parent_window_name].start_bound
-            elif start_or_end == "end":
-                start_bound = all_nodes[parent_window_name].end_bound
+            if window.start == "trigger":
+                start_bound = all_nodes["trigger"].start_bound
+            else:
+                parent_window_name, start_or_end = window.start.split(".")
+                if start_or_end == "start":
+                    start_bound = all_nodes[parent_window_name].start_bound
+                elif start_or_end == "end":
+                    start_bound = all_nodes[parent_window_name].end_bound
+
+        # Handle end bound similarly
         if end_bound is None:
             if window.end == "trigger":
-                end_bound = root.end_bound
+                end_bound = all_nodes["trigger"].end_bound
             else:
                 parent_window_name, start_or_end = window.end.split(".")
                 if start_or_end == "start":
@@ -892,6 +1229,7 @@ def convert_task_config(
             label=window.label,
             index_timestamp=window.index_timestamp,
             tensorized_predicates=tensorized_predicates,
+            early_stop=early_stop,
         )
         all_nodes[window_name] = node
 
@@ -915,10 +1253,21 @@ TimeScale = Literal["Y", "M", "W", "D", "h", "m", "s"]
 
 @dataclass
 class SequenceLabeler:
+    """Zero-shot prediction Labeler for Autoregressive Generative MEDS models.
+
+    Attributes:
+        tree (AutoregressiveWindowTree)
+        gap_days (float): temporal gap in days between index timestamp and trigger
+        batch_size (int)
+        time_scale (TimeScale)
+        early_stop (bool): whether to early stop within a temporal window if a label is found
+    """
+
     tree: AutoregressiveWindowTree
     gap_days: float
     batch_size: int
     time_scale: TimeScale = "D"  # Default to days
+    early_stop: bool = False
     _finished: bool = False
 
     def _convert_to_days(self, times: torch.Tensor) -> torch.Tensor:
@@ -942,22 +1291,32 @@ class SequenceLabeler:
 
     @classmethod
     def from_yaml_str(
-        cls, yaml_str: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+        cls,
+        yaml_str: str,
+        metadata_df: pl.DataFrame,
+        batch_size: int,
+        time_scale: TimeScale = "D",
+        early_stop: bool = False,
     ) -> "SequenceLabeler":
         """Create a labeler from YAML task configuration string."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
             f.write(yaml_str)
             f.flush()
             task_config = TaskExtractorConfig.load(f.name)
-        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale, early_stop)
 
     @classmethod
     def from_yaml_file(
-        cls, yaml_path: str, metadata_df: pl.DataFrame, batch_size: int, time_scale: TimeScale = "D"
+        cls,
+        yaml_path: str,
+        metadata_df: pl.DataFrame,
+        batch_size: int,
+        time_scale: TimeScale = "D",
+        early_stop: bool = False,
     ) -> "SequenceLabeler":
         """Create a labeler from YAML task configuration file."""
         task_config = TaskExtractorConfig.load(yaml_path)
-        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale)
+        return cls.from_task_config(task_config, metadata_df, batch_size, time_scale, early_stop)
 
     @classmethod
     def from_task_config(
@@ -966,22 +1325,25 @@ class SequenceLabeler:
         metadata_df: pl.DataFrame,
         batch_size: int,
         time_scale: TimeScale = "D",
+        early_stop: bool = False,
     ) -> "SequenceLabeler":
         """Create a labeler from TaskExtractorConfig object."""
-        tree = convert_task_config(config, batch_size, metadata_df)
+        tree = convert_task_config(config, batch_size, metadata_df, early_stop)
         gap_days, prior_windows, _ = calculate_index_timestamp_info(tree)
 
         # Initialize tree
         tree.root.initialize_batch(batch_size)
         tree.root.ignore_windows(prior_windows + ["trigger"])
 
-        return cls(tree=tree, gap_days=gap_days, batch_size=batch_size, time_scale=time_scale)
+        return cls(
+            tree=tree, gap_days=gap_days, batch_size=batch_size, time_scale=time_scale, early_stop=early_stop
+        )
 
     def process_step(
         self,
-        tokens: torch.Tensor | list[int],
-        times: torch.Tensor | list[float],
-        values: torch.Tensor | list[float],
+        tokens: torch.Tensor,
+        times: torch.Tensor,
+        values: torch.Tensor,
     ) -> torch.Tensor:
         """
         Process one step of token sequences.
@@ -994,14 +1356,6 @@ class SequenceLabeler:
         Returns:
             Tensor of status values for each sequence [batch_size]
         """
-        # Convert inputs to tensors if needed
-        if not isinstance(tokens, torch.Tensor):
-            tokens = torch.tensor(tokens, dtype=torch.long)
-        if not isinstance(times, torch.Tensor):
-            times = torch.tensor(times, dtype=torch.float)
-        if not isinstance(values, torch.Tensor):
-            values = torch.tensor(values, dtype=torch.float)
-
         # Ensure proper shapes
         tokens = tokens.view(self.batch_size)
         times = times.view(self.batch_size)
@@ -1018,6 +1372,9 @@ class SequenceLabeler:
         self._finished = ((status == 2) | (status == 3)).all()
 
         return status
+
+    def get_status(self) -> torch.Tensor:
+        return self.tree.root.get_status()
 
     def get_labels(self) -> torch.Tensor:
         """Get final binary labels for each sequence in the batch."""
