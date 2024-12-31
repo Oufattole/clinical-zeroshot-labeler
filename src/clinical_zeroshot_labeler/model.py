@@ -185,7 +185,7 @@ class BaseGenerativeModel(ABC):
                     inter.cached_kv = [t[..., -(max_seq_len - 1) :, :] for t in inter.cached_kv]
         return x, cache, current_start_pos
 
-    @torch.no_grad()
+    @torch.inference_mode()
     @eval_decorator
     def generate(
         self,
